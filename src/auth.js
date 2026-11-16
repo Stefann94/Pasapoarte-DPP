@@ -31,10 +31,10 @@ export function requireAdmin(req, config) {
  * Authenticates a client (economic operator) API key. A suspended tenant can
  * still read and export its data (portability) but cannot change anything.
  */
-export function requireTenant(req, st, { write = false } = {}) {
+export async function requireTenant(req, st, { write = false } = {}) {
   const token = bearer(req);
   if (!token?.startsWith(`${TENANT_KEY_PREFIX}_`)) throw unauthorized();
-  const row = st.apiKeyAuth.get(sha256(token));
+  const row = await st.apiKeyAuth.get(sha256(token));
   if (!row) throw unauthorized();
   if (write && row.status !== 'active') {
     throw new HttpError(403, 'tenant_suspended', 'Account is suspended: passports stay public, changes are disabled');
@@ -43,15 +43,15 @@ export function requireTenant(req, st, { write = false } = {}) {
 }
 
 /** Returns the accessor (from bearer token or session cookie) or null for anonymous visitors. */
-export function findAccessor(req, st) {
+export async function findAccessor(req, st) {
   const token = bearer(req);
   if (token) {
     if (!token.startsWith(`${ACCESSOR_TOKEN_PREFIX}_`)) throw unauthorized();
-    const accessor = st.accessorByToken.get(sha256(token));
+    const accessor = await st.accessorByToken.get(sha256(token));
     if (!accessor) throw unauthorized('Access token is invalid or revoked');
     return accessor;
   }
   const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
   if (!sid) return null;
-  return st.sessionAccessor.get(sha256(sid), Date.now()) ?? null;
+  return (await st.sessionAccessor.get(sha256(sid), Date.now())) ?? null;
 }

@@ -1,7 +1,5 @@
 import http from 'node:http';
-import { mkdirSync } from 'node:fs';
-import path from 'node:path';
-import { openDb, prepareStatements } from './db.js';
+import { openDatabase, statements } from './db.js';
 import { createBlobStore } from './blobstore.js';
 import { applySecurityHeaders, clientIp, createRateLimiter, createRouter, HttpError, sendHtml, sendJson, wantsJson } from './http.js';
 import { createSnapshotCache } from './passports.js';
@@ -10,12 +8,15 @@ import { registerAdminRoutes } from './routes/admin.js';
 import { registerTenantRoutes } from './routes/tenant.js';
 import { registerPublicRoutes } from './routes/public.js';
 
-export function createApp(config) {
-  mkdirSync(config.dataDir, { recursive: true });
-  const db = openDb(path.join(config.dataDir, 'dpp.sqlite'));
-  const st = prepareStatements(db);
-  const blobs = createBlobStore(path.join(config.dataDir, 'blobs'));
-  const snapshots = createSnapshotCache(st);
+/**
+ * Builds the application. Returns `handler` (a Node request listener, used
+ * directly as the Vercel function) and `server` (for running it standalone).
+ */
+export async function createApp(config) {
+  const db = await openDatabase(config);
+  const st = statements(db);
+  const blobs = createBlobStore(config);
+  const snapshots = createSnapshotCache(st, { ttlMs: config.snapshotTtlMs });
   const limiter = createRateLimiter({ windowMs: 60_000, max: config.rateLimitPerMinute });
 
   const router = createRouter();
@@ -23,10 +24,10 @@ export function createApp(config) {
   registerTenantRoutes(router);
   registerPublicRoutes(router);
 
-  const sweep = setInterval(() => st.sessionSweep.run(Date.now()), 10 * 60_000);
+  const sweep = setInterval(() => st.sessionSweep.run(Date.now()).catch(() => {}), 10 * 60_000);
   sweep.unref();
 
-  const server = http.createServer(async (req, res) => {
+  async function handler(req, res) {
     applySecurityHeaders(res, config);
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
@@ -49,18 +50,21 @@ export function createApp(config) {
       if (isPage) sendHtml(req, res, status, renderErrorPage({ lang: pickLang(req, url), status, message }));
       else sendJson(req, res, status, { error: code, message });
     }
-  });
+  }
+
+  const server = http.createServer(handler);
   server.keepAliveTimeout = 65_000; // longer than typical load balancer idle timeouts
 
   return {
+    handler,
     server,
     db,
-    close() {
+    async close() {
       clearInterval(sweep);
       limiter.stop();
       server.close();
       server.closeAllConnections?.();
-      db.close();
+      await db.close();
     },
   };
 }

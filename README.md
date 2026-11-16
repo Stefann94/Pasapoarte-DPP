@@ -22,28 +22,38 @@ Platforma **nu generează** conținutul pașapoartelor. Îl primește de la oper
 
 Calea critică este scanarea QR (`GET /p/:id`), așa că acolo e optimizată:
 
-- **Cache de snapshot per revizie**: o singură căutare după cheia primară per cerere. Fără parsare JSON și fără join-uri. Rămâne corect și cu mai multe procese pe aceeași bază.
+- **Cache de pașapoarte în memorie.** La prima accesare, pașaportul, versiunea curentă și documentele vin dintr-o **singură** interogare. Timp de 2 secunde, accesările următoare nu mai ating deloc baza de date. După aceea ajunge o verificare minusculă a reviziei. Modificările invalidează imediat cache-ul.
 - **Răspunsuri pre-randate și pre-comprimate** (brotli/gzip), păstrate în cache.
-- **ETag + 304**: un browser care revine nu mai descarcă pagina.
-- Toate interogările SQL sunt **pregătite o singură dată** la pornire. SQLite rulează în WAL, cu cache mare.
-- Documentele sunt trimise în **stream**, fără să fie încărcate în memorie. Hash-ul SHA-256 servește drept ETag.
-- **Zero dependențe npm**: pornire instantanee, nimic de instalat sau de actualizat.
+- **ETag + 304** pentru browsere. Pe Vercel, `s-maxage` permite rețelei CDN să servească scanările repetate fără să mai pornească funcția.
+- Funcția Vercel rulează în **Frankfurt (fra1)**, lângă baza Supabase din aceeași regiune.
+- Documentele sunt trimise în **stream**. Hash-ul SHA-256 servește drept ETag.
 
-Măsurat cu `node scripts/bench.js` (laptop, un singur proces Node, clientul de test rulând în același proces): **~2.000–2.400 cereri/s, p50 ≈ 20 ms la 50 de conexiuni simultane**.
+Măsurat cu `npm run bench` (laptop, un singur proces, clientul de test în același proces): **~2.100–2.700 cereri/s, p50 ≈ 17–19 ms la 50 de conexiuni simultane**.
 
-## Pornire rapidă
+## Pornire locală
 
-Necesită Node.js ≥ 24 (testat pe Node 26). Nu e nevoie de `npm install`.
+Necesită Node.js ≥ 22. Local nu aveți nevoie de Supabase: dacă `DATABASE_URL` lipsește, aplicația folosește automat PGlite, un PostgreSQL real care rulează în proces, cu datele salvate în `data/`.
 
 ```powershell
+npm install
 copy .env.example .env      # apoi editați ADMIN_TOKEN
-npm start                   # pornește serverul pe http://localhost:3000
+npm start                   # http://localhost:3000
 npm run demo                # (alt terminal) creează un client și un pașaport demo
-npm test                    # rulează testele
-node scripts/bench.js       # benchmark
+npm test
+npm run bench
 ```
 
-`npm run demo` afișează adresa pașaportului și tokenurile pentru accesul restricționat. Deschideți adresa în browser și introduceți un token în secțiunea „Acces restricționat”.
+## Publicare pe Vercel + Supabase
+
+1. **Supabase**: creați un proiect în regiunea **Central EU (Frankfurt)**.
+2. Din Supabase, copiați:
+   - *Project Settings → Database → Connection string → **Transaction pooler*** (portul 6543) → `DATABASE_URL`
+   - *Project Settings → API* → `SUPABASE_URL` și cheia **service_role** → `SUPABASE_SERVICE_ROLE_KEY` (secretă; nu ajunge niciodată în browser)
+3. Local, puneți aceste valori în `.env` și rulați **o singură dată** `npm run migrate`. Scriptul creează tabelele (în schema `dpp`, neexpusă de API-ul Supabase) și bucket-ul privat `dpp-documents`.
+4. **Vercel**: *Project → Settings → Environment Variables*. Adăugați `ADMIN_TOKEN`, `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (opțional `BASE_URL`), apoi *Redeploy*.
+5. Verificați `https://<proiect>.vercel.app/healthz`, care trebuie să răspundă `{"status":"ok","database":"postgres","storage":"supabase"}`.
+
+Limită Vercel: cererile pot avea maximum 4,5 MB, deci documentele sunt limitate la 4 MB. Pentru fișiere mai mari, pasul următor este încărcarea directă în Supabase Storage prin URL semnat.
 
 ## API
 
@@ -98,30 +108,33 @@ Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/passports -Headers
 
 ```
 src/
-  index.js        pornire server
+  index.js        pornire server local
   app.js          server HTTP, gestionarea erorilor, rate limit
   config.js       configurare din variabile de mediu
-  db.js           schema SQLite + toate interogările (prepared statements)
+  db.js           adaptoare PostgreSQL (pg / PGlite) + toate interogările
+  schema.sql      schema bazei de date (schema "dpp")
   passports.js    validare, versiuni, cache de snapshot, vizualizare pe niveluri
   portability.js  export/import
   audit.js        jurnal înlănțuit
-  blobstore.js    stocare documente adresată prin conținut
+  blobstore.js    documente: Supabase Storage sau disc local, adresate prin SHA-256
   auth.js         chei API, tokenuri de acces, sesiuni
   http.js         router, compresie, ETag, utilitare
   views.js        HTML public (RO/EN)
   routes/         admin, tenant (client), public
-test/             teste cap-coadă (node:test)
-scripts/          demo și benchmark
+api/index.js      punctul de intrare pentru Vercel
+vercel.json       rutare, regiune fra1
+test/             teste cap-coadă (node:test, pe PGlite)
+scripts/          migrare Supabase, demo, benchmark
 ```
 
 ## Ce lipsește până la producție
 
 MVP-ul demonstrează fluxul complet, dar înainte de clienți reali trebuie făcute următoarele:
 
-1. **Bază de date administrată.** Mutare de pe SQLite pe PostgreSQL administrat într-o regiune UE (de ex. **Supabase**, regiunea Frankfurt), cu backup automat și restaurare la un moment anterior (PITR). Toate interogările sunt deja grupate în `src/db.js`.
-2. **Stocare documente în object storage** (Supabase Storage, S3 sau compatibil), cu backup separat. Interfața `blobstore.js` rămâne aceeași.
-3. **Domeniu stabil pe termen lung** pentru `BASE_URL`, plus TLS și un reverse proxy/CDN în față.
-4. **Monitorizare și alerte** (disponibilitate, erori), plus teste periodice de restaurare.
+1. **Backup Supabase**: activați Point-in-Time Recovery (planul Pro) și testați periodic o restaurare.
+2. **Domeniu stabil pe termen lung** pentru `BASE_URL`. Adresa `*.vercel.app` nu trebuie tipărită pe etichete.
+3. **Documente mai mari de 4 MB**: încărcare directă în Storage prin URL semnat.
+4. **Monitorizare și alerte** (disponibilitate, erori).
 5. **Procedură de verificare a organizațiilor** care primesc acces restricționat, ajustată când Comisia finalizează regulile de acces.
 6. **Integrarea cu registrul UE**, dacă preluați și înregistrarea în numele clienților.
 7. **Ancorarea externă a jurnalului de audit** (publicarea periodică a ultimului hash în afara bazei de date).

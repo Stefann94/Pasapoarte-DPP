@@ -11,8 +11,8 @@ const PDF = Buffer.from('%PDF-1.4\n% test document\n%%EOF\n');
 
 async function startInstance() {
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'dpp-test-'));
-  const config = loadConfig({ ADMIN_TOKEN: ADMIN, DATA_DIR: dataDir, BASE_URL: 'https://passport.example.test' });
-  const app = createApp(config);
+  const config = loadConfig({ ADMIN_TOKEN: ADMIN, DATA_DIR: dataDir, PGLITE_DIR: 'memory://', BASE_URL: 'https://passport.example.test' });
+  const app = await createApp(config);
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${app.server.address().port}`;
   const call = async (method, p, { token, json, body, headers = {} } = {}) => {
@@ -30,8 +30,8 @@ async function startInstance() {
   return {
     app,
     call,
-    stop() {
-      app.close();
+    async stop() {
+      await app.close();
       rmSync(dataDir, { recursive: true, force: true });
     },
   };
@@ -63,9 +63,9 @@ describe('DPP hosting', () => {
     a = await startInstance();
     b = await startInstance();
   });
-  after(() => {
-    a.stop();
-    b.stop();
+  after(async () => {
+    await a.stop();
+    await b.stop();
   });
 
   test('admin endpoints require the admin token', async () => {
@@ -269,8 +269,9 @@ describe('DPP hosting', () => {
     const v = await a.call('GET', '/admin/audit/verify', { token: ADMIN });
     assert.equal(v.data.ok, true);
     assert.ok(v.data.entries >= 8);
-    assert.throws(() => a.app.db.exec("UPDATE audit_log SET actor = 'mallory'"), /append-only/);
-    assert.throws(() => a.app.db.exec('DELETE FROM passport_versions'), /immutable/);
+    await assert.rejects(a.app.db.query("UPDATE dpp.audit_log SET actor = 'mallory'"), /append-only/);
+    await assert.rejects(a.app.db.query('DELETE FROM dpp.passport_versions'), /immutable/);
+    await assert.rejects(a.app.db.query('TRUNCATE dpp.audit_log CASCADE'), /append-only/);
   });
 
   test('unknown passports return 404', async () => {

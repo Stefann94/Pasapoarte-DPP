@@ -22,9 +22,9 @@ export const EXPORT_FORMAT_VERSION = 1;
  */
 export async function buildExport(st, blobs, config, tenant, { includeDocuments = true } = {}) {
   const passports = [];
-  for (const p of st.passportAllForTenant.all(tenant.tenantId)) {
+  for (const p of await st.passportAllForTenant.all(tenant.tenantId)) {
     const documents = [];
-    for (const d of st.docAll.all(p.id)) {
+    for (const d of await st.docAll.all(p.id)) {
       const doc = {
         id: d.id,
         name: d.name,
@@ -44,7 +44,7 @@ export async function buildExport(st, blobs, config, tenant, { includeDocuments 
       category: p.category,
       createdAt: p.created_at,
       currentVersion: p.current_version,
-      versions: st.versionAll.all(p.id).map((v) => ({
+      versions: (await st.versionAll.all(p.id)).map((v) => ({
         version: v.version,
         dataSha256: v.data_hash,
         note: v.note,
@@ -115,21 +115,21 @@ export async function importBundle(db, st, blobs, tenant, bundle) {
     const id = isPlainObject(raw) ? raw.id : undefined;
     try {
       const p = preparePassport(raw);
-      if (st.passportById.get(p.id)) {
+      if (await st.passportById.get(p.id)) {
         results.push({ id, status: 'skipped', reason: 'A passport with this id already exists' });
         continue;
       }
       for (const d of p.documents) d.sha256 = await blobs.put(d.buf);
       const last = p.versions.at(-1);
-      tx(db, () => {
-        st.passportInsert.run(p.id, tenant.tenantId, p.productIdentifier, p.category, last.version, p.createdAt, last.createdAt);
+      await tx(db, async (t) => {
+        await t.passportInsert.run(p.id, tenant.tenantId, p.productIdentifier, p.category, last.version, p.createdAt, last.createdAt);
         for (const v of p.versions) {
-          st.versionInsert.run(p.id, v.version, JSON.stringify(v.data), v.dataSha256, v.note, v.createdAt, `import:${tenant.keyId}`);
+          await t.versionInsert.run(p.id, v.version, JSON.stringify(v.data), v.dataSha256, v.note, v.createdAt, `import:${tenant.keyId}`);
         }
         for (const d of p.documents) {
-          st.docInsert.run(d.id, p.id, d.name, d.contentType, d.buf.length, d.sha256, d.access, d.createdAt, d.removedAt);
+          await t.docInsert.run(d.id, p.id, d.name, d.contentType, d.buf.length, d.sha256, d.access, d.createdAt, d.removedAt);
         }
-        appendAudit(st, {
+        await appendAudit(t, {
           actor,
           action: 'passport.imported',
           target: p.id,

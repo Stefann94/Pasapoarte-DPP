@@ -90,18 +90,19 @@ export const hashData = (data) => sha256(canonicalJson(data));
 
 const conflict = (message) => new HttpError(409, 'conflict', message);
 
-export function createPassport(db, st, { tenant, id, productIdentifier, category, data, note }) {
+export async function createPassport(db, { tenant, id, productIdentifier, category, data, note }) {
   validatePassportFields({ id, productIdentifier, category });
   const normalized = normalizeData(data);
+  const cleanNote = validateNote(note);
   const passportId = id ?? randomUUID();
   const now = new Date().toISOString();
   const dataHash = hashData(normalized);
   const actor = `key:${tenant.keyId}`;
   try {
-    tx(db, () => {
-      st.passportInsert.run(passportId, tenant.tenantId, productIdentifier, category, 1, now, now);
-      st.versionInsert.run(passportId, 1, JSON.stringify(normalized), dataHash, validateNote(note), now, actor);
-      appendAudit(st, { actor, action: 'passport.created', target: passportId, details: { version: 1, dataHash } });
+    await tx(db, async (st) => {
+      await st.passportInsert.run(passportId, tenant.tenantId, productIdentifier, category, 1, now, now);
+      await st.versionInsert.run(passportId, 1, JSON.stringify(normalized), dataHash, cleanNote, now, actor);
+      await appendAudit(st, { actor, action: 'passport.created', target: passportId, details: { version: 1, dataHash } });
     });
   } catch (err) {
     if (isUniqueViolation(err)) throw conflict('A passport with this id or productIdentifier already exists');
@@ -110,31 +111,32 @@ export function createPassport(db, st, { tenant, id, productIdentifier, category
   return { id: passportId, version: 1, dataHash };
 }
 
-export function addVersion(db, st, { tenant, passport, data, note, expectedVersion }) {
+export async function addVersion(db, { tenant, passport, data, note, expectedVersion }) {
   const normalized = normalizeData(data);
+  const cleanNote = validateNote(note);
   const dataHash = hashData(normalized);
   const actor = `key:${tenant.keyId}`;
-  return tx(db, () => {
-    // Re-read inside the transaction so concurrent updates cannot both win.
-    const current = st.passportById.get(passport.id);
+  return tx(db, async (st) => {
+    // Row lock: concurrent updates of the same passport are serialised.
+    const current = await st.passportLockForUpdate.get(passport.id);
     if (expectedVersion !== undefined && expectedVersion !== current.current_version) {
       throw conflict(`expectedVersion ${expectedVersion} does not match current version ${current.current_version}`);
     }
-    const latest = st.versionGet.get(passport.id, current.current_version);
+    const latest = await st.versionGet.get(passport.id, current.current_version);
     if (latest.data_hash === dataHash) return { id: passport.id, version: current.current_version, dataHash, changed: false };
     const version = current.current_version + 1;
     const now = new Date().toISOString();
-    st.versionInsert.run(passport.id, version, JSON.stringify(normalized), dataHash, validateNote(note), now, actor);
-    st.passportBump.run(version, now, passport.id);
-    appendAudit(st, { actor, action: 'passport.updated', target: passport.id, details: { version, dataHash } });
+    await st.versionInsert.run(passport.id, version, JSON.stringify(normalized), dataHash, cleanNote, now, actor);
+    await st.passportBump.run(version, now, passport.id);
+    await appendAudit(st, { actor, action: 'passport.updated', target: passport.id, details: { version, dataHash } });
     return { id: passport.id, version, dataHash, changed: true };
   });
 }
 
 // ---------------------------------------------------------------- reads
 
-export function ownPassport(st, tenant, id) {
-  const p = st.passportById.get(id);
+export async function ownPassport(st, tenant, id) {
+  const p = await st.passportById.get(id);
   if (!p || p.tenant_id !== tenant.tenantId) throw new HttpError(404, 'passport_not_found', 'Passport not found');
   return p;
 }
@@ -155,35 +157,56 @@ export const documentJson = (config, passportId, d) => ({
 });
 
 /**
- * Snapshot cache for the public read path. Versions are immutable and every
- * change bumps passports.rev, so a cached snapshot is valid as long as the rev
- * matches: one primary-key lookup per request, no JSON parsing, no joins.
- * This stays correct even with several processes sharing the database.
+ * Snapshot cache for the public read path (QR scans).
+ *  - A miss loads passport + current version + documents in ONE query.
+ *  - A hit younger than ttlMs is served with zero database round trips.
+ *  - An older hit costs one tiny primary-key lookup (rev check); versions are
+ *    immutable and every change bumps passports.rev, so this is always correct,
+ *    also with several server instances sharing the database.
+ *  - Writes on this instance call invalidate(), so they show up immediately.
+ * Each snapshot also stores its rendered, compressed responses.
  */
-export function createSnapshotCache(st, max = 10_000) {
+export function createSnapshotCache(st, { max = 10_000, ttlMs = 2000 } = {}) {
   const lru = createLru(max);
+
+  async function fetchFresh(id) {
+    const row = await st.snapshotLoad.get(id);
+    if (!row) return null;
+    const { data, data_hash, documents_json, ...passport } = row;
+    const parsed = JSON.parse(data);
+    const snap = {
+      passport,
+      rev: passport.rev,
+      version: passport.current_version,
+      updatedAt: passport.updated_at,
+      dataHash: data_hash,
+      data: parsed,
+      publicHash: hashData(parsed.public),
+      documents: JSON.parse(documents_json),
+      rendered: new Map(),
+      checkedAt: Date.now(),
+    };
+    lru.set(id, snap);
+    return snap;
+  }
+
   return {
     /** Returns {passport, snapshot} or null if the passport does not exist. */
-    load(id) {
-      const passport = st.passportById.get(id);
-      if (!passport) return null;
+    async load(id) {
       let snap = lru.get(id);
-      if (!snap || snap.rev !== passport.rev) {
-        const v = st.versionGet.get(id, passport.current_version);
-        snap = {
-          rev: passport.rev,
-          version: v.version,
-          updatedAt: passport.updated_at,
-          dataHash: v.data_hash,
-          data: JSON.parse(v.data),
-          documents: st.docActive.all(id),
-          rendered: new Map(), // per (level, lang, format) prepared bodies
-        };
-        snap.publicHash = hashData(snap.data.public);
-        lru.set(id, snap);
+      if (snap && Date.now() - snap.checkedAt > ttlMs) {
+        const row = await st.passportRev.get(id);
+        if (!row) {
+          lru.delete(id);
+          return null;
+        }
+        if (row.rev === snap.rev) snap.checkedAt = Date.now();
+        else snap = null;
       }
-      return { passport, snapshot: snap };
+      snap ??= await fetchFresh(id);
+      return snap ? { passport: snap.passport, snapshot: snap } : null;
     },
+    invalidate: (id) => lru.delete(id),
     get size() {
       return lru.size;
     },

@@ -13,7 +13,9 @@ const concurrency = Number(process.argv[3] ?? 50);
 const ADMIN = 'bench-admin-token-0123456789abcdef';
 
 const dataDir = mkdtempSync(path.join(os.tmpdir(), 'dpp-bench-'));
-const app = createApp(loadConfig({ ADMIN_TOKEN: ADMIN, DATA_DIR: dataDir, RATE_LIMIT_PER_MINUTE: '100000000' }));
+const app = await createApp(
+  loadConfig({ ADMIN_TOKEN: ADMIN, DATA_DIR: dataDir, PGLITE_DIR: 'memory://', RATE_LIMIT_PER_MINUTE: '100000000' }),
+);
 await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${app.server.address().port}`;
 
@@ -57,5 +59,5 @@ console.log(`${seconds}s per scenario, ${concurrency} concurrent connections, 20
 await run('HTML, brotli', { 'Accept-Encoding': 'br' });
 await run('JSON, gzip', { 'Accept-Encoding': 'gzip', Accept: 'application/json' });
 
-app.close();
+await app.close();
 rmSync(dataDir, { recursive: true, force: true });

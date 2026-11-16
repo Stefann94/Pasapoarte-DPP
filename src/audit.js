@@ -5,19 +5,21 @@ const entryHash = (e) =>
 
 /**
  * Append-only, hash-chained audit log. Each entry commits to the previous one,
- * so editing or removing a past entry breaks verification. For stronger
- * guarantees, periodically publish the latest hash outside this database.
+ * so editing or removing a past entry breaks verification. Must be called with
+ * transaction-bound statements (see tx in db.js). For stronger guarantees,
+ * periodically publish the latest hash outside this database.
  */
-export function appendAudit(st, { actor, action, target = null, details = {} }) {
-  const prev_hash = st.auditLast.get()?.hash ?? 'GENESIS';
+export async function appendAudit(st, { actor, action, target = null, details = {} }) {
+  await st.auditLock.get();
+  const prev_hash = (await st.auditLast.get())?.hash ?? 'GENESIS';
   const entry = { ts: new Date().toISOString(), actor, action, target, details: canonicalJson(details), prev_hash };
-  st.auditInsert.run(entry.ts, actor, action, target, entry.details, prev_hash, entryHash(entry));
+  await st.auditInsert.run(entry.ts, actor, action, target, entry.details, prev_hash, entryHash(entry));
 }
 
-export function verifyAudit(st) {
+export async function verifyAudit(st) {
   let prev = 'GENESIS';
   let count = 0;
-  for (const row of st.auditAll.iterate()) {
+  for (const row of await st.auditAll.all()) {
     if (row.prev_hash !== prev || entryHash(row) !== row.hash) {
       return { ok: false, entries: count, brokenAtSeq: row.seq };
     }
