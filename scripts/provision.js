@@ -73,11 +73,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ------------------------------------------------------------------ 1. Supabase project
 
 step('Supabase project');
-let project = (await supa('GET', '/v1/projects')).find((p) => p.name === PROJECT_NAME);
+const allProjects = await supa('GET', '/v1/projects');
+let project = env.SUPABASE_PROJECT_REF
+  ? allProjects.find((p) => (p.ref ?? p.id) === env.SUPABASE_PROJECT_REF)
+  : allProjects.find((p) => p.name === PROJECT_NAME);
+if (env.SUPABASE_PROJECT_REF && !project) {
+  throw new Error(`Project ${env.SUPABASE_PROJECT_REF} is not visible to this token (check the token's organization)`);
+}
 let dbPass = env.SUPABASE_DB_PASSWORD;
 
 if (project) {
-  ok(`reusing existing project "${PROJECT_NAME}" (${project.region})`);
+  ok(`reusing existing project "${project.name}" (${project.region})`);
   if (!dbPass) {
     throw new Error(
       'Project exists but its database password is unknown. Put it in .env as SUPABASE_DB_PASSWORD ' +
