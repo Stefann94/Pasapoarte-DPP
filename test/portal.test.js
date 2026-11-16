@@ -257,6 +257,62 @@ describe('models, bulk passports and client portal', () => {
     assert.equal(edited.data.data.public.batteryStatus, 'remanufacturată');
   });
 
+  test('bulk document upload: model files, per-battery matching by file name, no-JS fallback', async () => {
+    const m = await a.call('POST', '/api/models', { token: key, json: { name: 'BULK-1', category: 'industrial', data: { public: { chemistry: 'LFP' } } } });
+    const bulk = await a.call('POST', `/api/models/${m.data.id}/passports`, {
+      token: key,
+      json: { items: [{ productIdentifier: 'BK-001' }, { productIdentifier: 'BK-002' }, { productIdentifier: 'BK_003' }] },
+    });
+    const byPid = Object.fromEntries(bulk.data.items.map((i) => [i.productIdentifier, i.id]));
+    const send = (target, name, body, type, extra = '') =>
+      a.call('POST', `/portal/upload?target=${target}&id=${m.data.id}&access=public&name=${encodeURIComponent(name)}${extra}`, {
+        cookie,
+        body,
+        headers: { 'Content-Type': type, 'Sec-Fetch-Site': 'same-origin' },
+      });
+
+    // Shared model documents, one request per file (what the page script does).
+    assert.equal((await send('model', 'Fisa tehnica.pdf', PDF, 'application/pdf')).status, 201);
+    // Windows reports .csv as an Excel type: the extension decides.
+    assert.equal((await send('model', 'compozitie.csv', 'a,b\n1,2\n', 'application/vnd.ms-excel')).status, 201);
+
+    // Per battery: the file name starts with the serial number.
+    const r1 = await send('battery', 'BK-001_raport test.pdf', PDF, 'application/pdf');
+    assert.equal(r1.status, 201);
+    assert.equal(r1.data.productIdentifier, 'BK-001');
+    assert.equal((await send('battery', 'BK-002.pdf', PDF, 'application/pdf')).data.productIdentifier, 'BK-002');
+    assert.equal((await send('battery', 'BK_003.pdf', PDF, 'application/pdf')).data.productIdentifier, 'BK_003', 'identifiers with "_" still match');
+    const unknown = await send('battery', 'NU-EXISTA.pdf', PDF, 'application/pdf');
+    assert.equal(unknown.status, 404);
+    assert.match(unknown.data.message, /Nicio baterie/);
+    const otherModel = await send('battery', 'SN-1.pdf', PDF, 'application/pdf');
+    assert.equal(otherModel.status, 400, 'a battery of another model is refused');
+
+    const v1 = await a.call('GET', `/p/${byPid['BK-001']}?format=json`);
+    assert.deepEqual(v1.data.documents.map((d) => d.name).sort(), ['BK-001_raport test.pdf', 'Fisa tehnica.pdf', 'compozitie.csv']);
+    const v2 = await a.call('GET', `/p/${byPid['BK-002']}?format=json`);
+    assert.ok(!v2.data.documents.some((d) => d.name.startsWith('BK-001')), 'files go only to their own battery');
+
+    // Without JavaScript the form posts all files at once; failures are listed, the rest is stored.
+    const fd = new FormData();
+    fd.set('access', 'authority');
+    fd.append('file', new Blob([PDF], { type: 'application/pdf' }), 'BK-002_certificat.pdf');
+    fd.append('file', new Blob([PDF], { type: 'application/pdf' }), 'ALTA-BATERIE.pdf');
+    const fallback = await a.call('POST', `/portal/models/${m.data.id}/battery-documents`, { cookie, form: fd });
+    assert.equal(fallback.status, 207);
+    assert.ok(fallback.text.includes('1 din 2 fișiere'));
+    assert.ok(fallback.text.includes('ALTA-BATERIE.pdf'));
+
+    // The page script is served same-origin and allowed by the portal CSP.
+    const script = await a.call('GET', '/portal/assets/upload.js');
+    assert.match(script.headers.get('content-type'), /javascript/);
+    const page = await a.call('GET', `/portal/models/${m.data.id}`, { cookie });
+    assert.match(page.headers.get('content-security-policy'), /script-src 'self'/);
+    assert.ok(page.text.includes('data-bulk-upload'));
+
+    assert.equal((await a.call('POST', `/portal/upload?target=model&id=${m.data.id}&name=x.pdf`, { body: PDF, headers: { 'Content-Type': 'application/pdf' } })).status, 401);
+  });
+
   test('other tenants cannot see each other in the portal', async () => {
     const t2 = await a.call('POST', '/admin/tenants', { token: ADMIN, json: { name: 'Other SRL' } });
     const u2 = await a.call('POST', `/admin/tenants/${t2.data.tenant.id}/users`, { token: ADMIN, json: { email: 'bob@example.com' } });
@@ -271,11 +327,11 @@ describe('models, bulk passports and client portal', () => {
   test('export v2 includes models and imports elsewhere with the same public pages', async () => {
     const exp = await a.call('GET', '/api/export', { token: key });
     assert.equal(exp.data.formatVersion, 2);
-    assert.equal(exp.data.models.length, 2);
+    assert.equal(exp.data.models.length, 3);
 
     const t = await b.call('POST', '/admin/tenants', { token: ADMIN, json: { name: 'Importer SRL' } });
     const imp = await b.call('POST', '/api/import', { token: t.data.apiKey.token, json: exp.data });
-    assert.equal(imp.data.models.imported, 2);
+    assert.equal(imp.data.models.imported, 3);
     assert.equal(imp.data.errors, 0);
 
     for (const p of passports) {

@@ -3,8 +3,9 @@ import QRCode from 'qrcode';
 import { appendAudit } from '../audit.js';
 import { sha256 } from '../crypto.js';
 import { tx } from '../db.js';
-import { removeDocument, storeDocument } from '../documents.js';
-import { HttpError, readForm, redirect, sendHtml } from '../http.js';
+import { matchBatteryByFileName, removeDocument, storeDocument } from '../documents.js';
+import { HttpError, preparedBody, readBody, readForm, redirect, sendHtml, sendJson, sendPrepared } from '../http.js';
+import { UPLOAD_SCRIPT_SOURCE } from '../portal/upload-script.js';
 import {
   addModelVersion,
   addVersion,
@@ -41,9 +42,12 @@ import {
 } from '../portal/views.js';
 
 const PAGE_SIZE = 100;
+const UPLOAD_SCRIPT = preparedBody(UPLOAD_SCRIPT_SOURCE, 'text/javascript; charset=utf-8');
 const FORM_LIMIT = 2 * 1024 * 1024;
 const flashOf = (url) => url.searchParams.get('msg');
-const noStore = { 'Cache-Control': 'private, no-store' };
+const PORTAL_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const noStore = { 'Cache-Control': 'private, no-store', 'Content-Security-Policy': PORTAL_CSP };
 
 /** Class used to leave a handler with a redirect to the login page. */
 class LoginRequired extends Error {}
@@ -190,6 +194,7 @@ export function registerPortalRoutes(router) {
       flash: flashOf(url),
       errors,
       bulkText,
+      maxBytes: ctx.config.maxDocumentBytes,
     }), noStore);
   }
 
@@ -289,6 +294,7 @@ export function registerPortalRoutes(router) {
       mirrorEvents,
       flash: flashOf(url),
       errors,
+      maxBytes: config.maxDocumentBytes,
     }), noStore);
   }
 
@@ -382,24 +388,103 @@ export function registerPortalRoutes(router) {
 
   // ------------------------------------------------------------ documents
 
-  const upload = (kind) => page(async ({ req, res, db, st, blobs, params, user, config, snapshots }) => {
-    const owner = kind === 'model' ? await ownModel(st, user, params.id) : await ownPassport(st, user, params.id);
-    const form = await readMultipart(req, config.maxDocumentBytes);
-    const file = form.get('file');
-    if (!file || typeof file === 'string' || !file.size) throw new HttpError(400, 'invalid_request', 'Alegeți un fișier.');
+  /**
+   * Stores one uploaded file. target: 'model' (shared document), 'passport'
+   * (one battery), or 'battery' (a model's battery, found from the file name).
+   */
+  async function storeOne({ db, st, blobs, user, target, owner, file, access }) {
+    let passportId = target === 'passport' ? owner.id : null;
+    let productIdentifier = null;
+    if (target === 'battery') {
+      const hit = await matchBatteryByFileName(st, user.tenantId, file.name);
+      if (!hit) throw new HttpError(404, 'battery_not_found', 'Nicio baterie cu acest identificator (numele fișierului trebuie să înceapă cu numărul de serie).');
+      const passport = await st.passportById.get(hit.passportId);
+      if (passport.model_id !== owner.id) throw new HttpError(400, 'wrong_model', `Bateria ${hit.productIdentifier} aparține altui model.`);
+      passportId = passport.id;
+      productIdentifier = hit.productIdentifier;
+    }
     await storeDocument(db, blobs, {
       tenant: user,
-      passportId: kind === 'passport' ? owner.id : null,
-      modelId: kind === 'model' ? owner.id : null,
+      passportId,
+      modelId: target === 'model' ? owner.id : null,
       name: file.name || 'document',
-      access: String(form.get('access') ?? 'public'),
+      access,
       contentType: file.type,
-      buf: Buffer.from(await file.arrayBuffer()),
+      buf: file.buf,
     });
-    if (kind === 'model') snapshots.invalidateAll();
-    else snapshots.invalidate(owner.id);
-    redirect(res, `/portal/${kind}s/${encodeURIComponent(owner.id)}?msg=document_added`);
+    return { name: file.name, productIdentifier, passportId };
+  }
+
+  const ownerOf = (target, st, user, id) => (target === 'passport' ? ownPassport(st, user, id) : ownModel(st, user, id));
+  const invalidateFor = (target, snapshots, stored) => {
+    if (target === 'model') snapshots.invalidateAll();
+    else for (const s of stored) if (s.passportId) snapshots.invalidate(s.passportId);
+  };
+
+  // Form fallback (works without JavaScript): every selected file in one request.
+  const upload = (target) => page(async (ctx) => {
+    const { req, res, db, st, blobs, params, user, config, snapshots } = ctx;
+    const owner = await ownerOf(target, st, user, params.id);
+    const form = await readMultipart(req, config.maxImportBytes);
+    const files = form.getAll('file').filter((f) => f && typeof f !== 'string' && f.size);
+    if (!files.length) throw new HttpError(400, 'invalid_request', 'Alegeți cel puțin un fișier.');
+    const access = String(form.get('access') ?? 'public');
+    const stored = [];
+    const errors = [];
+    for (const f of files) {
+      try {
+        stored.push(await storeOne({ db, st, blobs, user, target, owner, access, file: { name: f.name, type: f.type, buf: Buffer.from(await f.arrayBuffer()) } }));
+      } catch (err) {
+        if (!(err instanceof HttpError) || err.status >= 500) throw err;
+        errors.push(`${f.name}: ${err.message}`);
+      }
+    }
+    invalidateFor(target, snapshots, stored);
+    const back = target === 'passport' ? `/portal/passports/${encodeURIComponent(owner.id)}` : `/portal/models/${encodeURIComponent(owner.id)}`;
+    if (errors.length) {
+      const summary = `${stored.length} din ${files.length} fișiere au fost încărcate.`;
+      if (target === 'passport') return renderPassport(ctx, { status: 207, errors: [summary, ...errors] });
+      return renderModel(ctx, { status: 207, errors: [summary, ...errors] });
+    }
+    redirect(res, `${back}?msg=documents_added`);
   }, { write: true });
+
+  // Used by the page script: one file per request, so any number of files can
+  // be uploaded within the hosting platform's per-request size limit.
+  router.post('/portal/upload', async (ctx) => {
+    const { req, res, url, db, st, blobs, config, snapshots } = ctx;
+    const fail = (status, message) => sendJson(req, res, status, { ok: false, message });
+    try {
+      checkOrigin(req, config);
+      const user = await portalUser(req, st);
+      if (!user) return fail(401, 'Sesiunea a expirat. Autentificați-vă din nou.');
+      if (user.status !== 'active') return fail(403, 'Contul este suspendat: modificările sunt blocate.');
+      const target = url.searchParams.get('target');
+      if (!['model', 'passport', 'battery'].includes(target)) return fail(400, 'Destinație necunoscută.');
+      const owner = await ownerOf(target, st, user, url.searchParams.get('id') ?? '');
+      const name = url.searchParams.get('name') ?? 'document';
+      const buf = await readBody(req, config.maxDocumentBytes);
+      const stored = await storeOne({
+        db, st, blobs, user, target, owner,
+        access: url.searchParams.get('access') ?? 'public',
+        file: { name, type: req.headers['content-type'], buf },
+      });
+      invalidateFor(target, snapshots, [stored]);
+      sendJson(req, res, 201, { ok: true, name: stored.name, productIdentifier: stored.productIdentifier });
+    } catch (err) {
+      if (err instanceof HttpError && err.status < 500) {
+        const message = err.status === 413 ? `Fișierul depășește ${Math.round(config.maxDocumentBytes / 1048576)} MB.` : err.message;
+        if (err.status === 413) res.setHeader('Connection', 'close');
+        return fail(err.status, message);
+      }
+      throw err;
+    }
+  });
+
+  // Static script for the bulk upload forms (no inline scripts: strict CSP).
+  router.get('/portal/assets/upload.js', ({ req, res }) => {
+    sendPrepared(req, res, 200, UPLOAD_SCRIPT, { 'Cache-Control': 'public, max-age=3600' });
+  });
 
   const remove = (kind) => page(async ({ res, db, st, params, user, snapshots }) => {
     const owner = kind === 'model' ? await ownModel(st, user, params.id) : await ownPassport(st, user, params.id);
@@ -415,6 +500,7 @@ export function registerPortalRoutes(router) {
   }, { write: true });
 
   router.post('/portal/models/:id/documents', upload('model'));
+  router.post('/portal/models/:id/battery-documents', upload('battery'));
   router.post('/portal/models/:id/documents/:docId/remove', remove('model'));
   router.post('/portal/passports/:id/documents', upload('passport'));
   router.post('/portal/passports/:id/documents/:docId/remove', remove('passport'));

@@ -20,6 +20,7 @@ export const FLASH = {
   passports_created: 'Pașapoartele au fost create.',
   passport_updated: 'Pașaportul a fost actualizat.',
   document_added: 'Documentul a fost încărcat.',
+  documents_added: 'Fișierele au fost încărcate.',
   document_removed: 'Documentul a fost ascuns.',
   password_set: 'Parola a fost setată. Vă puteți autentifica.',
   password_changed: 'Parola a fost schimbată.',
@@ -74,7 +75,7 @@ function layout({ title, user, body, flash, errors }) {
     : '';
   return `<!doctype html>
 <html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex"><title>${esc(title)} · Pașapoarte DPP</title><style>${CSS}</style></head>
+<meta name="robots" content="noindex"><title>${esc(title)} · Pașapoarte DPP</title><style>${CSS}</style><script src="/portal/assets/upload.js" defer></script></head>
 <body><main>${nav}${suspended}${flashHtml}${errorHtml}<h1 style="margin:0 0 16px">${esc(title)}</h1>${body}</main></body></html>`;
 }
 
@@ -199,7 +200,22 @@ export function modelFormPage({ user, model, values, errors }) {
 
 // ------------------------------------------------------------------ documents
 
-function documentsSection({ docs, uploadAction, removeBase, note }) {
+const ACCESS_OPTIONS = () => Object.entries(ACCESS_RO).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('');
+
+/** Bulk upload form: works without JavaScript; with it, uploads file by file with progress. */
+function bulkUploadForm({ action, bulkUrl, maxBytes, label, hint }) {
+  return `<form method="post" action="${action}" enctype="multipart/form-data" data-bulk-upload="${bulkUrl}" data-max-bytes="${maxBytes}" class="stack" style="margin-top:12px">
+      <div class="field"><label>${esc(label)}</label>
+        <div class="row"><input type="file" name="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp,.csv,.json,.txt">
+        <span class="muted">sau un folder întreg:</span><input type="file" name="file" webkitdirectory multiple></div></div>
+      <div class="row"><span class="muted">Acces</span>
+        <select name="access">${ACCESS_OPTIONS()}</select><button type="submit">Încarcă fișierele</button></div>
+      <progress hidden style="width:100%;margin-top:8px"></progress><p class="hint" data-status></p><ul class="errors-list" data-log style="color:var(--danger)"></ul>
+      ${hint ? `<p class="hint">${hint}</p>` : ''}
+    </form>`;
+}
+
+function documentsSection({ docs, uploadAction, removeBase, note, bulkUrl, maxBytes }) {
   const rows = docs.length
     ? docs
         .map(
@@ -211,11 +227,7 @@ function documentsSection({ docs, uploadAction, removeBase, note }) {
     : '<tr><td colspan="4" class="muted">Niciun document.</td></tr>';
   return `<section><h2>Documente</h2>${note ? `<p class="hint">${esc(note)}</p>` : ''}
     <div class="table-wrap"><table><thead><tr><th>Fișier</th><th>Acces</th><th>Mărime</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
-    <form method="post" action="${uploadAction}" enctype="multipart/form-data" style="margin-top:12px">
-      <input type="file" name="file" required accept=".pdf,.png,.jpg,.jpeg,.webp,.csv,.json,.txt">
-      <select name="access">${Object.entries(ACCESS_RO).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('')}</select>
-      <button type="submit">Încarcă</button></form>
-    <p class="hint">PDF, imagini, CSV, JSON sau text.</p></section>`;
+    ${bulkUploadForm({ action: uploadAction, bulkUrl, maxBytes, label: 'Alegeți unul sau mai multe fișiere (PDF, imagini, CSV, JSON, text)' })}</section>`;
 }
 
 // ------------------------------------------------------------------ model page
@@ -231,7 +243,7 @@ function dataSummary(data) {
   }).join('');
 }
 
-export function modelPage({ user, model, data, docs, passports, total, page, pageSize, flash, errors, bulkText }) {
+export function modelPage({ user, model, data, docs, passports, total, page, pageSize, flash, errors, bulkText, maxBytes }) {
   const rows = passports.length
     ? passports
         .map(
@@ -270,7 +282,13 @@ export function modelPage({ user, model, data, docs, passports, total, page, pag
       <p class="hint">Fișierul CSV conține pentru fiecare baterie adresa care trebuie codificată în QR, gata pentru programul de etichete.</p>
       <div class="table-wrap"><table><thead><tr><th>Identificator</th><th>Pașaport</th><th>Cod QR</th><th>Actualizat</th></tr></thead><tbody>${rows}</tbody></table></div>${pager}</section>
 
-      ${documentsSection({ docs, uploadAction: `${base}/documents`, removeBase: `${base}/documents`, note: 'Documentele modelului apar pe pașaportul fiecărei baterii din acest model și sunt stocate o singură dată.' })}
+      ${documentsSection({ docs, uploadAction: `${base}/documents`, removeBase: `${base}/documents`, bulkUrl: `/portal/upload?target=model&id=${esc(model.id)}`, maxBytes, note: 'Documentele modelului apar pe pașaportul fiecărei baterii din acest model și sunt stocate o singură dată.' })}
+
+      <section><h2>Documente per baterie (în bulk)</h2>
+      <p class="hint">Selectați oricâte fișiere sau un folder întreg. Fiecare fișier ajunge automat la bateria al cărei număr de serie apare la începutul numelui:
+      <code>BAT-0001.pdf</code>, <code>BAT-0001_raport-test.pdf</code> sau <code>BAT-0001 certificat.pdf</code> → bateria <code>BAT-0001</code>.
+      Fișierele care nu corespund niciunei baterii din acest model sunt raportate și nu se încarcă.</p>
+      ${bulkUploadForm({ action: `${base}/battery-documents`, bulkUrl: `/portal/upload?target=battery&id=${esc(model.id)}`, maxBytes, label: 'Fișiere pentru bateriile acestui model' })}</section>
 
       <section><div class="row" style="justify-content:space-between"><h2>Date comune ale modelului</h2>
       <a class="btn secondary" href="${base}/edit">Editează</a></div>${dataSummary(data)}</section>`,
@@ -328,7 +346,7 @@ export function accountPage({ user, error, flash }) {
   });
 }
 
-export function passportPage({ user, passport, model, values, effective, docs, versions, qrSvg, publicUrl, mirrorEvents = [], flash, errors }) {
+export function passportPage({ user, passport, model, values, effective, docs, versions, qrSvg, publicUrl, mirrorEvents = [], flash, errors, maxBytes }) {
   const versionRows = versions
     .slice()
     .reverse()
@@ -355,7 +373,7 @@ export function passportPage({ user, passport, model, values, effective, docs, v
         <div class="field"><label for="note">Notă pentru istoric (opțional)</label><input id="note" name="note" maxlength="1000"></div>
         <button type="submit">Salvează o versiune nouă</button></form>
 
-      ${documentsSection({ docs, uploadAction: `/portal/passports/${esc(passport.id)}/documents`, removeBase: `/portal/passports/${esc(passport.id)}/documents`, note: model ? 'Documentele marcate „din model” se gestionează din pagina modelului.' : '' })}
+      ${documentsSection({ docs, uploadAction: `/portal/passports/${esc(passport.id)}/documents`, removeBase: `/portal/passports/${esc(passport.id)}/documents`, bulkUrl: `/portal/upload?target=passport&id=${esc(passport.id)}`, maxBytes, note: model ? 'Documentele marcate „din model” se gestionează din pagina modelului.' : '' })}
 
       <section><h2>Datele afișate în pașaport (model + baterie)</h2>${dataSummary(effective)}</section>
       <section><h2>Istoric versiuni</h2><div class="table-wrap"><table><thead><tr><th>Versiune</th><th>Data</th><th>Notă</th></tr></thead><tbody>${versionRows}</tbody></table></div></section>`,

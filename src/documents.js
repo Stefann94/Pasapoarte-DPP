@@ -8,10 +8,33 @@ import { DOCUMENT_TYPES, validateAccess, validateDocumentName } from './passport
  * Validates and stores a document for a passport OR a model (exactly one).
  * Model documents are stored once and shown on every passport of the model.
  */
+const TYPE_BY_EXTENSION = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  json: 'application/json',
+  csv: 'text/csv',
+  txt: 'text/plain',
+};
+
+/**
+ * The declared type when it is allowed, otherwise the type implied by the
+ * file extension (browsers on Windows report .csv as an Excel type, some
+ * report nothing at all). The content check below still applies.
+ */
+export function resolveType(contentType, name) {
+  const declared = (contentType ?? '').split(';')[0].trim().toLowerCase();
+  if (DOCUMENT_TYPES[declared]) return declared;
+  const ext = String(name ?? '').toLowerCase().split('.').pop();
+  return TYPE_BY_EXTENSION[ext] ?? declared;
+}
+
 export async function storeDocument(db, blobs, { tenant, passportId = null, modelId = null, name, access, contentType, buf }) {
   const cleanName = validateDocumentName(name);
   const cleanAccess = validateAccess(access ?? 'public');
-  const type = (contentType ?? '').split(';')[0].trim().toLowerCase();
+  const type = resolveType(contentType, cleanName);
   const sniff = DOCUMENT_TYPES[type];
   if (!sniff) {
     throw new HttpError(415, 'unsupported_media_type', `Allowed types: ${Object.keys(DOCUMENT_TYPES).join(', ')}`);
@@ -34,6 +57,25 @@ export async function storeDocument(db, blobs, { tenant, passportId = null, mode
     });
     return passportId ? t.docGet.get(id, passportId) : t.modelDocGet.get(id, modelId);
   });
+}
+
+/**
+ * Finds the battery a file belongs to from its name: "BAT-0001.pdf" or
+ * "BAT-0001_test-report.pdf" (or "BAT-0001 test report.pdf") -> "BAT-0001".
+ * Tries the whole name first, so identifiers containing "_" still work.
+ */
+export async function matchBatteryByFileName(st, tenantId, fileName) {
+  const stem = String(fileName).replace(/\.[^.]+$/, '').trim();
+  const candidates = [stem];
+  for (const sep of ['_', ' ']) {
+    const i = stem.indexOf(sep);
+    if (i > 0) candidates.push(stem.slice(0, i));
+  }
+  for (const candidate of [...new Set(candidates)]) {
+    const hit = await st.passportFindByIdentifier.get(tenantId, candidate);
+    if (hit) return { passportId: hit.id, productIdentifier: candidate };
+  }
+  return null;
 }
 
 export async function removeDocument(db, { tenant, passportId = null, modelId = null, documentId }) {
