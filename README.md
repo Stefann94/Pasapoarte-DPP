@@ -6,6 +6,10 @@ Platforma **nu generează** conținutul pașapoartelor. Îl primește de la oper
 
 ## Ce face
 
+**Pentru clienți există un portal** (`/portal`): se autentifică, creează modele de baterii, adaugă bateriile prin listă sau CSV, încarcă documente, descarcă codurile QR și lista de adrese pentru etichete și exportă tot. Nu e nevoie de programatori.
+
+**Model + baterie.** Datele comune (producător, chimie, capacitate, documente) se completează o singură dată per **model**. Pentru fiecare baterie se stochează doar identificatorul și eventualele date proprii (data fabricației, starea). Pagina publică afișează combinația lor. Volumul stocat scade de sute până la mii de ori, iar o corecție la model apare imediat pe toate pașapoartele modelului.
+
 | Funcție | Detalii |
 |---|---|
 | Adresă permanentă | `https://<domeniu>/p/<id>`, adresa la care trimite codul QR. Id-ul poate fi furnizat de client (util la migrare). |
@@ -68,6 +72,8 @@ Autentificare: `Authorization: Bearer <token>`.
 | POST | `/admin/tenants/:id/api-keys` | cheie API nouă |
 | POST | `/admin/api-keys/:id/revoke` | revocă o cheie |
 | POST | `/admin/tenants/:id/suspend` / `reactivate` | suspendă sau reactivează modificările |
+| POST | `/admin/tenants/:id/users` `{email}` | creează un cont în portal și întoarce linkul de activare (7 zile) |
+| POST | `/admin/users/:id/reset` | link nou de activare (parolă uitată) |
 | POST | `/admin/accessors` `{name, role}` | creează un token de acces restricționat (`legitimate_interest` / `authority`), după verificarea organizației |
 | POST | `/admin/accessors/:id/revoke` | revocă tokenul și închide sesiunile |
 | GET | `/admin/audit`, `/admin/audit/verify` | jurnal de audit și verificarea lanțului |
@@ -76,7 +82,12 @@ Autentificare: `Authorization: Bearer <token>`.
 
 | Metodă | Cale | Rol |
 |---|---|---|
-| POST | `/api/passports` | creează: `{id?, productIdentifier, category: ev\|lmt\|industrial, data: {public, legitimateInterest?, authorities?}, note?}` |
+| POST | `/api/models` | model: `{name, category, data}` |
+| GET / PUT | `/api/models/:id` | citește / versiune nouă (`{data, expectedVersion?}`) |
+| POST | `/api/models/:id/passports` | creare în masă: `{items: [{productIdentifier, data?}]}`, maximum 5.000 per cerere |
+| GET | `/api/models/:id/passports` | bateriile modelului |
+| POST | `/api/models/:id/documents?name&access` | document comun pentru toate bateriile modelului |
+| POST | `/api/passports` | creează (opțional `modelId`): `{id?, productIdentifier, category: ev\|lmt\|industrial, data: {public, legitimateInterest?, authorities?}, note?}` |
 | GET | `/api/passports?limit&offset` | listă |
 | GET | `/api/passports/:id` | date curente, istoricul versiunilor, documente |
 | PUT | `/api/passports/:id` | versiune nouă: `{data, note?, expectedVersion?}` |
@@ -104,6 +115,14 @@ $body = @{ productIdentifier = "BAT-0001"; category = "industrial";
 Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/passports -Headers $h -Body $body -ContentType "application/json"
 ```
 
+## Portalul pentru clienți
+
+1. Administratorul creează contul: `POST /admin/tenants/:id/users {"email": "..."}` și trimite clientului `setupUrl`.
+2. Clientul deschide linkul, își setează parola (minimum 10 caractere) și intră pe `/portal`.
+3. Fluxul de lucru: **Model nou** → completează datele comune → **Adaugă baterii** (lipește numerele de serie sau încarcă un CSV) → descarcă **CSV-ul cu adresele QR** pentru programul de etichete.
+
+Securitate: parole scrypt, sesiuni HttpOnly pe 12 ore, blocarea cererilor venite de pe alte site-uri, izolare completă între clienți. Un cont suspendat poate doar citi și exporta.
+
 ## Arhitectură
 
 ```
@@ -120,7 +139,10 @@ src/
   auth.js         chei API, tokenuri de acces, sesiuni
   http.js         router, compresie, ETag, utilitare
   views.js        HTML public (RO/EN)
-  routes/         admin, tenant (client), public
+  fields.js       câmpurile uzuale (formulare + etichete RO/EN)
+  documents.js    încărcare/ascundere documente (pașaport sau model)
+  portal/         portal clienți: autentificare, formulare, pagini
+  routes/         admin, tenant (API client), public, portal
 api/index.js      punctul de intrare pentru Vercel
 vercel.json       rutare, regiune fra1
 test/             teste cap-coadă (node:test, pe PGlite)

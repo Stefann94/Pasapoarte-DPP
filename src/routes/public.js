@@ -87,7 +87,7 @@ export function registerPublicRoutes(router) {
   });
 
   router.get('/p/:id/documents/:docId', async ({ req, res, params, st, blobs }) => {
-    const doc = await st.docGet.get(params.docId, params.id);
+    const doc = await st.docForPassport.get(params.docId, params.id);
     if (!doc) throw new HttpError(404, 'document_not_found', 'Document not found');
     const accessor = await findAccessor(req, st);
     const level = accessor?.role ?? 'public';

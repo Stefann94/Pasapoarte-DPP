@@ -39,7 +39,7 @@ export async function requireTenant(req, st, { write = false } = {}) {
   if (write && row.status !== 'active') {
     throw new HttpError(403, 'tenant_suspended', 'Account is suspended: passports stay public, changes are disabled');
   }
-  return row;
+  return { ...row, actor: `key:${row.keyId}` };
 }
 
 /** Returns the accessor (from bearer token or session cookie) or null for anonymous visitors. */

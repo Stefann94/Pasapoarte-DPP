@@ -92,6 +92,66 @@ CREATE TABLE IF NOT EXISTS dpp.audit_log (
   hash      TEXT NOT NULL
 );
 
+-- Battery models: data shared by every battery of a model (most of Annex XIII)
+-- is stored once here. A passport's effective data = model data overlaid with
+-- the battery's own (item-level) data.
+CREATE TABLE IF NOT EXISTS dpp.models (
+  id              TEXT PRIMARY KEY,
+  tenant_id       TEXT NOT NULL REFERENCES dpp.tenants(id),
+  name            TEXT NOT NULL,
+  category        TEXT NOT NULL,
+  current_version INTEGER NOT NULL,
+  rev             INTEGER NOT NULL DEFAULT 1,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  UNIQUE (tenant_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS dpp.model_versions (
+  model_id   TEXT NOT NULL REFERENCES dpp.models(id),
+  version    INTEGER NOT NULL,
+  data       TEXT NOT NULL,
+  data_hash  TEXT NOT NULL,
+  note       TEXT,
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  PRIMARY KEY (model_id, version)
+);
+
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS model_id TEXT REFERENCES dpp.models(id);
+CREATE INDEX IF NOT EXISTS passports_model ON dpp.passports (model_id, created_at, id);
+
+-- A document belongs either to one passport or to a model (then it is shown on
+-- every passport of that model and stored only once).
+ALTER TABLE dpp.documents ADD COLUMN IF NOT EXISTS model_id TEXT REFERENCES dpp.models(id);
+ALTER TABLE dpp.documents ALTER COLUMN passport_id DROP NOT NULL;
+CREATE INDEX IF NOT EXISTS documents_model ON dpp.documents (model_id);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'documents_owner') THEN
+    ALTER TABLE dpp.documents ADD CONSTRAINT documents_owner CHECK ((passport_id IS NULL) <> (model_id IS NULL));
+  END IF;
+END
+$$;
+
+-- Client portal users (people working for a tenant).
+CREATE TABLE IF NOT EXISTS dpp.users (
+  id               TEXT PRIMARY KEY,
+  tenant_id        TEXT NOT NULL REFERENCES dpp.tenants(id),
+  email            TEXT NOT NULL UNIQUE,
+  password_hash    TEXT,
+  setup_token_hash TEXT UNIQUE,
+  setup_expires_at BIGINT,
+  created_at       TEXT NOT NULL,
+  disabled_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dpp.portal_sessions (
+  id_hash    TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL REFERENCES dpp.users(id),
+  expires_at BIGINT NOT NULL
+);
+
 CREATE OR REPLACE FUNCTION dpp.reject_change() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION '%', TG_ARGV[0];
@@ -112,6 +172,14 @@ DROP TRIGGER IF EXISTS versions_no_truncate ON dpp.passport_versions;
 CREATE TRIGGER versions_no_truncate BEFORE TRUNCATE ON dpp.passport_versions
   FOR EACH STATEMENT EXECUTE FUNCTION dpp.reject_change('passport versions are immutable');
 
+DROP TRIGGER IF EXISTS model_versions_immutable ON dpp.model_versions;
+CREATE TRIGGER model_versions_immutable BEFORE UPDATE OR DELETE ON dpp.model_versions
+  FOR EACH ROW EXECUTE FUNCTION dpp.reject_change('model versions are immutable');
+
+ALTER TABLE dpp.models            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dpp.model_versions    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dpp.users             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dpp.portal_sessions   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dpp.tenants           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dpp.api_keys          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dpp.passports         ENABLE ROW LEVEL SECURITY;

@@ -98,13 +98,30 @@ export function statements(conn) {
 
     passportById: q('SELECT * FROM dpp.passports WHERE id = $1'),
     passportInsert: q(`INSERT INTO dpp.passports
-      (id, tenant_id, product_identifier, category, current_version, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)`),
+      (id, tenant_id, product_identifier, category, current_version, created_at, updated_at, model_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`),
+    // Bulk creation (one round trip per table for thousands of batteries).
+    passportBulkInsert: q(`INSERT INTO dpp.passports
+      (id, tenant_id, product_identifier, category, current_version, created_at, updated_at, model_id)
+      SELECT u.id, $3, u.pid, $4, 1, $5, $5, $6 FROM unnest($1::text[], $2::text[]) AS u(id, pid)`),
+    versionBulkInsert: q(`INSERT INTO dpp.passport_versions
+      (passport_id, version, data, data_hash, note, created_at, created_by)
+      SELECT u.id, 1, u.data, u.hash, $4, $5, $6 FROM unnest($1::text[], $2::text[], $3::text[]) AS u(id, data, hash)`),
+    passportExistingIdentifiers: q(`SELECT product_identifier FROM dpp.passports
+      WHERE tenant_id = $1 AND product_identifier = ANY($2::text[]) LIMIT 50`),
+    passportExistingIds: q('SELECT id FROM dpp.passports WHERE id = ANY($1::text[]) LIMIT 50'),
     passportBump: q('UPDATE dpp.passports SET current_version = $1, rev = rev + 1, updated_at = $2 WHERE id = $3'),
     passportTouch: q('UPDATE dpp.passports SET rev = rev + 1, updated_at = $1 WHERE id = $2'),
     passportLockForUpdate: q('SELECT * FROM dpp.passports WHERE id = $1 FOR UPDATE'),
-    passportList: q(`SELECT id, product_identifier, category, current_version, created_at, updated_at
+    passportList: q(`SELECT id, product_identifier, category, current_version, created_at, updated_at, model_id
                      FROM dpp.passports WHERE tenant_id = $1 ORDER BY created_at, id LIMIT $2 OFFSET $3`),
+    passportListByModel: q(`SELECT id, product_identifier, category, current_version, created_at, updated_at, model_id
+                     FROM dpp.passports WHERE model_id = $1 ORDER BY created_at, id LIMIT $2 OFFSET $3`),
+    passportCountByModel: q('SELECT COUNT(*)::int AS n FROM dpp.passports WHERE model_id = $1'),
+    passportRecent: q(`SELECT p.id, p.product_identifier, p.category, p.current_version, p.updated_at, m.name AS model_name
+                     FROM dpp.passports p LEFT JOIN dpp.models m ON m.id = p.model_id
+                     WHERE p.tenant_id = $1 ORDER BY p.updated_at DESC LIMIT $2`),
+    passportFindByIdentifier: q('SELECT id FROM dpp.passports WHERE tenant_id = $1 AND product_identifier = $2'),
     passportCount: q('SELECT COUNT(*)::int AS n FROM dpp.passports WHERE tenant_id = $1'),
     passportAllForTenant: q('SELECT * FROM dpp.passports WHERE tenant_id = $1 ORDER BY created_at, id'),
 
@@ -115,21 +132,51 @@ export function statements(conn) {
                     FROM dpp.passport_versions WHERE passport_id = $1 ORDER BY version`),
     versionAll: q('SELECT * FROM dpp.passport_versions WHERE passport_id = $1 ORDER BY version'),
 
-    // Public read path: passport + current version + active documents in ONE round trip.
+    // Public read path: passport + its version + model version + all documents in ONE round trip.
     snapshotLoad: q(`SELECT p.*, v.data, v.data_hash,
+        m.rev AS model_rev, m.name AS model_name, mv.version AS model_version, mv.data AS model_data,
         COALESCE((SELECT json_agg(d ORDER BY d.created_at, d.id)::text FROM dpp.documents d
-                  WHERE d.passport_id = p.id AND d.removed_at IS NULL), '[]') AS documents_json
+                  WHERE d.removed_at IS NULL
+                    AND (d.passport_id = p.id OR (p.model_id IS NOT NULL AND d.model_id = p.model_id))), '[]') AS documents_json
       FROM dpp.passports p
       JOIN dpp.passport_versions v ON v.passport_id = p.id AND v.version = p.current_version
+      LEFT JOIN dpp.models m ON m.id = p.model_id
+      LEFT JOIN dpp.model_versions mv ON mv.model_id = m.id AND mv.version = m.current_version
       WHERE p.id = $1`),
-    passportRev: q('SELECT rev FROM dpp.passports WHERE id = $1'),
+    passportRev: q(`SELECT p.rev, m.rev AS model_rev FROM dpp.passports p
+                    LEFT JOIN dpp.models m ON m.id = p.model_id WHERE p.id = $1`),
 
-    docInsert: q(`INSERT INTO dpp.documents (id, passport_id, name, content_type, size, sha256, access, created_at, removed_at)
-                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`),
+    modelInsert: q(`INSERT INTO dpp.models (id, tenant_id, name, category, current_version, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, 1, $5, $5)`),
+    modelById: q('SELECT * FROM dpp.models WHERE id = $1'),
+    modelLockForUpdate: q('SELECT * FROM dpp.models WHERE id = $1 FOR UPDATE'),
+    modelBump: q('UPDATE dpp.models SET current_version = $1, rev = rev + 1, updated_at = $2 WHERE id = $3'),
+    modelTouch: q('UPDATE dpp.models SET rev = rev + 1, updated_at = $1 WHERE id = $2'),
+    modelList: q(`SELECT m.*, (SELECT COUNT(*)::int FROM dpp.passports p WHERE p.model_id = m.id) AS passport_count
+                  FROM dpp.models m WHERE m.tenant_id = $1 ORDER BY m.name`),
+    modelAllForTenant: q('SELECT * FROM dpp.models WHERE tenant_id = $1 ORDER BY created_at, id'),
+    modelVersionInsert: q(`INSERT INTO dpp.model_versions (model_id, version, data, data_hash, note, created_at, created_by)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7)`),
+    modelVersionGet: q('SELECT * FROM dpp.model_versions WHERE model_id = $1 AND version = $2'),
+    modelVersionAll: q('SELECT * FROM dpp.model_versions WHERE model_id = $1 ORDER BY version'),
+
+    docInsert: q(`INSERT INTO dpp.documents (id, passport_id, model_id, name, content_type, size, sha256, access, created_at, removed_at)
+                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`),
     docActive: q('SELECT * FROM dpp.documents WHERE passport_id = $1 AND removed_at IS NULL ORDER BY created_at, id'),
     docAll: q('SELECT * FROM dpp.documents WHERE passport_id = $1 ORDER BY created_at, id'),
     docGet: q('SELECT * FROM dpp.documents WHERE id = $1 AND passport_id = $2 AND removed_at IS NULL'),
     docRemove: q('UPDATE dpp.documents SET removed_at = $1 WHERE id = $2 AND passport_id = $3 AND removed_at IS NULL'),
+    modelDocActive: q('SELECT * FROM dpp.documents WHERE model_id = $1 AND removed_at IS NULL ORDER BY created_at, id'),
+    modelDocAll: q('SELECT * FROM dpp.documents WHERE model_id = $1 ORDER BY created_at, id'),
+    modelDocGet: q('SELECT * FROM dpp.documents WHERE id = $1 AND model_id = $2 AND removed_at IS NULL'),
+    modelDocRemove: q('UPDATE dpp.documents SET removed_at = $1 WHERE id = $2 AND model_id = $3 AND removed_at IS NULL'),
+    docForTenant: q(`SELECT d.* FROM dpp.documents d
+                     LEFT JOIN dpp.passports p ON p.id = d.passport_id LEFT JOIN dpp.models m ON m.id = d.model_id
+                     WHERE d.id = $1 AND d.removed_at IS NULL AND COALESCE(p.tenant_id, m.tenant_id) = $2`),
+    // A document visible on a passport: its own, or its model's.
+    docForPassport: q(`SELECT d.* FROM dpp.documents d JOIN dpp.passports p ON p.id = $2
+                       WHERE d.id = $1 AND d.removed_at IS NULL
+                         AND (d.passport_id = p.id OR (p.model_id IS NOT NULL AND d.model_id = p.model_id))`),
 
     accessorInsert: q('INSERT INTO dpp.accessors (id, name, role, token_hash, created_at) VALUES ($1, $2, $3, $4, $5)'),
     accessorList: q('SELECT id, name, role, created_at, revoked_at FROM dpp.accessors ORDER BY created_at'),
@@ -150,6 +197,24 @@ export function statements(conn) {
                     VALUES ($1, $2, $3, $4, $5, $6, $7)`),
     auditRecent: q('SELECT * FROM dpp.audit_log ORDER BY seq DESC LIMIT $1'),
     auditAll: q('SELECT * FROM dpp.audit_log ORDER BY seq'),
+
+    userInsert: q(`INSERT INTO dpp.users (id, tenant_id, email, setup_token_hash, setup_expires_at, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6)`),
+    userByEmail: q(`SELECT u.*, t.name AS tenant_name, t.status AS tenant_status FROM dpp.users u
+                    JOIN dpp.tenants t ON t.id = u.tenant_id WHERE u.email = $1 AND u.disabled_at IS NULL`),
+    userBySetupToken: q('SELECT * FROM dpp.users WHERE setup_token_hash = $1 AND setup_expires_at > $2 AND disabled_at IS NULL'),
+    userSetPassword: q('UPDATE dpp.users SET password_hash = $1, setup_token_hash = NULL, setup_expires_at = NULL WHERE id = $2'),
+    userResetSetup: q('UPDATE dpp.users SET setup_token_hash = $1, setup_expires_at = $2 WHERE id = $3'),
+    userById: q('SELECT * FROM dpp.users WHERE id = $1'),
+    userList: q(`SELECT id, tenant_id, email, created_at, disabled_at, password_hash IS NOT NULL AS active
+                 FROM dpp.users WHERE tenant_id = $1 ORDER BY created_at`),
+    portalSessionInsert: q('INSERT INTO dpp.portal_sessions (id_hash, user_id, expires_at) VALUES ($1, $2, $3)'),
+    portalSessionUser: q(`SELECT u.id, u.email, t.id AS "tenantId", t.name AS "tenantName", t.status
+                          FROM dpp.portal_sessions s JOIN dpp.users u ON u.id = s.user_id JOIN dpp.tenants t ON t.id = u.tenant_id
+                          WHERE s.id_hash = $1 AND s.expires_at > $2 AND u.disabled_at IS NULL`),
+    portalSessionDelete: q('DELETE FROM dpp.portal_sessions WHERE id_hash = $1'),
+    portalSessionDeleteForUser: q('DELETE FROM dpp.portal_sessions WHERE user_id = $1'),
+    portalSessionSweep: q('DELETE FROM dpp.portal_sessions WHERE expires_at <= $1'),
 
     ping: q('SELECT 1 AS ok'),
   };

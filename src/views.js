@@ -1,3 +1,5 @@
+import { fieldLabel } from './fields.js';
+
 /* Server-rendered HTML for the public passport page. No JavaScript is shipped:
    the page is a single small HTML response with inline CSS, so it loads fast on
    a phone right after a QR scan. */
@@ -6,6 +8,7 @@ const STRINGS = {
   en: {
     title: 'Battery passport',
     productIdentifier: 'Battery identifier',
+    model: 'Model',
     category: 'Category',
     version: 'Version',
     updatedAt: 'Last updated',
@@ -28,6 +31,7 @@ const STRINGS = {
     error: 'Error',
     landing: 'Digital product passport hosting',
     landingText: 'Scan the QR code on a battery to view its passport.',
+    portal: 'Client portal: sign in',
     categories: {
       ev: 'Electric vehicle battery',
       lmt: 'Light means of transport battery',
@@ -38,6 +42,7 @@ const STRINGS = {
   ro: {
     title: 'Pașaportul bateriei',
     productIdentifier: 'Identificatorul bateriei',
+    model: 'Model',
     category: 'Categorie',
     version: 'Versiune',
     updatedAt: 'Ultima actualizare',
@@ -60,6 +65,7 @@ const STRINGS = {
     error: 'Eroare',
     landing: 'Găzduire pașapoarte digitale de produs',
     landingText: 'Scanați codul QR de pe baterie pentru a vedea pașaportul.',
+    portal: 'Portal clienți: autentificare',
     categories: {
       ev: 'Baterie pentru vehicul electric',
       lmt: 'Baterie pentru mijloace ușoare de transport',
@@ -80,6 +86,7 @@ export function pickLang(req, url) {
 }
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+export { CSS as PUBLIC_CSS };
 export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESC[c]);
 
 const CSS = `
@@ -97,7 +104,7 @@ section{background:var(--card);border:1px solid var(--line);border-radius:12px;p
 .meta div span{display:block;color:var(--muted);font-size:.85rem}
 .meta div strong{overflow-wrap:anywhere}
 dl{margin:0;display:grid;grid-template-columns:minmax(120px,32%) 1fr;gap:6px 16px}
-dt{color:var(--muted);overflow-wrap:anywhere}dd{margin:0;overflow-wrap:anywhere}
+dt{color:var(--muted);overflow-wrap:anywhere}dd{margin:0;overflow-wrap:anywhere;white-space:pre-line}
 dd dl{border-left:2px solid var(--line);padding-left:10px}
 ol{margin:0;padding-left:20px}
 .muted{color:var(--muted)}
@@ -140,8 +147,11 @@ function renderValue(v, t) {
   return esc(s);
 }
 
-function dataSection(title, obj, t) {
-  const body = obj && Object.keys(obj).length ? renderValue(obj, t) : `<p class="muted">${esc(t.empty)}</p>`;
+function dataSection(title, obj, t, lang) {
+  const keys = obj ? Object.keys(obj) : [];
+  const body = keys.length
+    ? `<dl>${keys.map((k) => `<dt>${esc(fieldLabel(k, lang))}</dt><dd>${renderValue(obj[k], t)}</dd>`).join('')}</dl>`
+    : `<p class="muted">${esc(t.empty)}</p>`;
   return `<section><h2>${esc(title)}</h2>${body}</section>`;
 }
 
@@ -155,14 +165,15 @@ export function renderPassportPage({ view, accessor, lang, error }) {
   const meta = `<section class="meta">
     <div><span>${esc(t.productIdentifier)}</span><strong>${esc(view.productIdentifier)}</strong></div>
     <div><span>${esc(t.category)}</span><strong>${esc(t.categories[view.category] ?? view.category)}</strong></div>
+    ${view.model ? `<div><span>${esc(t.model)}</span><strong>${esc(view.model.name)}</strong></div>` : ''}
     <div><span>${esc(t.version)}</span><strong>${view.version}</strong></div>
     <div><span>${esc(t.updatedAt)}</span><strong>${esc(updated)}</strong></div>
     <div style="grid-column:1/-1"><span>${esc(t.fingerprint)}</span><span class="mono">${esc(view.integrity.publicSha256)}</span></div>
   </section>`;
 
-  let sections = dataSection(t.public, view.data.public, t);
-  if (view.data.legitimateInterest) sections += dataSection(t.legitimateInterest, view.data.legitimateInterest, t);
-  if (view.data.authorities) sections += dataSection(t.authorities, view.data.authorities, t);
+  let sections = dataSection(t.public, view.data.public, t, lang);
+  if (view.data.legitimateInterest) sections += dataSection(t.legitimateInterest, view.data.legitimateInterest, t, lang);
+  if (view.data.authorities) sections += dataSection(t.authorities, view.data.authorities, t, lang);
 
   const docs = view.documents.length
     ? `<ul class="docs">${view.documents
@@ -196,5 +207,5 @@ export function renderErrorPage({ lang, status, message }) {
 
 export function renderLanding(lang) {
   const t = STRINGS[lang];
-  return layout({ lang, title: t.landing, langLinkBase: '/', body: `<section><p>${esc(t.landingText)}</p></section>` });
+  return layout({ lang, title: t.landing, langLinkBase: '/', body: `<section><p>${esc(t.landingText)}</p></section><section><a href="/portal/login">${esc(t.portal)}</a></section>` });
 }

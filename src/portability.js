@@ -4,27 +4,28 @@ import { sha256 } from './crypto.js';
 import { isUniqueViolation, tx } from './db.js';
 import { badRequest, HttpError, isPlainObject } from './http.js';
 import {
+  CATEGORIES,
   DOCUMENT_TYPES,
   hashData,
   normalizeData,
   validateAccess,
   validateDocumentName,
+  validateModelName,
   validatePassportFields,
 } from './passports.js';
 
 export const EXPORT_FORMAT = 'dpp-hosting-export';
-export const EXPORT_FORMAT_VERSION = 1;
+export const EXPORT_FORMAT_VERSION = 2; // v2 adds models; v1 bundles are still importable
 
 /**
  * Self-contained, documented export format. Moving to another provider (or
- * restoring here) needs nothing but this file: passport ids are preserved so
- * QR codes keep resolving once the domain points to the new host.
+ * restoring here) needs nothing but this file: model and passport ids are
+ * preserved so QR codes keep resolving once the domain points to the new host.
  */
 export async function buildExport(st, blobs, config, tenant, { includeDocuments = true } = {}) {
-  const passports = [];
-  for (const p of await st.passportAllForTenant.all(tenant.tenantId)) {
-    const documents = [];
-    for (const d of await st.docAll.all(p.id)) {
+  const exportDocs = async (rows) => {
+    const out = [];
+    for (const d of rows) {
       const doc = {
         id: d.id,
         name: d.name,
@@ -36,23 +37,44 @@ export async function buildExport(st, blobs, config, tenant, { includeDocuments 
         removedAt: d.removed_at,
       };
       if (includeDocuments) doc.contentBase64 = (await blobs.get(d.sha256)).toString('base64');
-      documents.push(doc);
+      out.push(doc);
     }
+    return out;
+  };
+  const versionsOf = (rows) =>
+    rows.map((v) => ({
+      version: v.version,
+      dataSha256: v.data_hash,
+      note: v.note,
+      createdAt: v.created_at,
+      createdBy: v.created_by,
+      data: JSON.parse(v.data),
+    }));
+
+  const models = [];
+  for (const m of await st.modelAllForTenant.all(tenant.tenantId)) {
+    models.push({
+      id: m.id,
+      name: m.name,
+      category: m.category,
+      createdAt: m.created_at,
+      currentVersion: m.current_version,
+      versions: versionsOf(await st.modelVersionAll.all(m.id)),
+      documents: await exportDocs(await st.modelDocAll.all(m.id)),
+    });
+  }
+
+  const passports = [];
+  for (const p of await st.passportAllForTenant.all(tenant.tenantId)) {
     passports.push({
       id: p.id,
       productIdentifier: p.product_identifier,
       category: p.category,
+      modelId: p.model_id ?? null,
       createdAt: p.created_at,
       currentVersion: p.current_version,
-      versions: (await st.versionAll.all(p.id)).map((v) => ({
-        version: v.version,
-        dataSha256: v.data_hash,
-        note: v.note,
-        createdAt: v.created_at,
-        createdBy: v.created_by,
-        data: JSON.parse(v.data),
-      })),
-      documents,
+      versions: versionsOf(await st.versionAll.all(p.id)),
+      documents: await exportDocs(await st.docAll.all(p.id)),
     });
   }
   return {
@@ -61,28 +83,32 @@ export async function buildExport(st, blobs, config, tenant, { includeDocuments 
     exportedAt: new Date().toISOString(),
     source: config.baseUrl,
     tenant: { id: tenant.tenantId, name: tenant.tenantName },
+    models,
     passports,
   };
 }
 
-/** Validates one exported passport fully before anything is written. */
-function preparePassport(p) {
-  if (!isPlainObject(p)) throw badRequest('passport entry must be an object');
-  validatePassportFields({ id: p.id, productIdentifier: p.productIdentifier, category: p.category });
-  if (p.id === undefined) throw badRequest('passport id is required for import');
-  if (!Array.isArray(p.versions) || !p.versions.length) throw badRequest('versions must be a non-empty array');
-
-  const versions = p.versions.map((v, i) => {
+function prepareVersions(list) {
+  if (!Array.isArray(list) || !list.length) throw badRequest('versions must be a non-empty array');
+  return list.map((v, i) => {
     if (!isPlainObject(v) || v.version !== i + 1) throw badRequest('versions must be numbered 1, 2, 3, ... in order');
     const data = normalizeData(v.data);
     const dataSha256 = hashData(data);
     if (v.dataSha256 && v.dataSha256 !== dataSha256) {
       throw badRequest(`version ${v.version}: data does not match dataSha256 (corrupted export?)`);
     }
-    return { version: v.version, data, dataSha256, note: typeof v.note === 'string' ? v.note : null, createdAt: String(v.createdAt ?? new Date().toISOString()) };
+    return {
+      version: v.version,
+      data,
+      dataSha256,
+      note: typeof v.note === 'string' ? v.note : null,
+      createdAt: String(v.createdAt ?? new Date().toISOString()),
+    };
   });
+}
 
-  const documents = (Array.isArray(p.documents) ? p.documents : []).map((d) => {
+function prepareDocuments(list) {
+  return (Array.isArray(list) ? list : []).map((d) => {
     if (!isPlainObject(d) || typeof d.contentBase64 !== 'string') {
       throw badRequest('every document must include contentBase64 (export with includeDocuments=1)');
     }
@@ -99,50 +125,108 @@ function preparePassport(p) {
       buf,
     };
   });
-
-  return { id: p.id, productIdentifier: p.productIdentifier, category: p.category, createdAt: String(p.createdAt ?? versions[0].createdAt), versions, documents };
 }
 
+const storeBlobs = async (blobs, docs) => {
+  for (const d of docs) d.sha256 = await blobs.put(d.buf);
+};
+
+const insertDocs = async (t, docs, passportId, modelId) => {
+  for (const d of docs) {
+    await t.docInsert.run(d.id, passportId, modelId, d.name, d.contentType, d.buf.length, d.sha256, d.access, d.createdAt, d.removedAt);
+  }
+};
+
 export async function importBundle(db, st, blobs, tenant, bundle) {
-  if (bundle.format !== EXPORT_FORMAT || bundle.formatVersion !== EXPORT_FORMAT_VERSION) {
-    throw badRequest(`Expected format "${EXPORT_FORMAT}" version ${EXPORT_FORMAT_VERSION}`);
+  if (bundle.format !== EXPORT_FORMAT || ![1, 2].includes(bundle.formatVersion)) {
+    throw badRequest(`Expected format "${EXPORT_FORMAT}" version 1 or 2`);
   }
   if (!Array.isArray(bundle.passports)) throw badRequest('passports must be an array');
-
-  const actor = `key:${tenant.keyId}`;
+  const models = Array.isArray(bundle.models) ? bundle.models : [];
+  const { actor } = tenant;
   const results = [];
+  const record = (kind, id, status, extra = {}) => results.push({ kind, id, status, ...extra });
+  const fail = (kind, id, err) => {
+    if (err instanceof HttpError) record(kind, id, 'error', { message: err.message });
+    else if (isUniqueViolation(err)) record(kind, id, 'error', { message: 'Conflicting id, name or productIdentifier' });
+    else throw err;
+  };
+
+  // Models first: passports reference them.
+  const importedModels = new Set();
+  for (const raw of models) {
+    const id = isPlainObject(raw) ? raw.id : undefined;
+    try {
+      if (typeof id !== 'string' || !id || id.length > 128) throw badRequest('model id is required');
+      const name = validateModelName(raw.name);
+      if (!CATEGORIES.includes(raw.category)) throw badRequest('invalid model category');
+      const versions = prepareVersions(raw.versions);
+      const documents = prepareDocuments(raw.documents);
+      const existing = await st.modelById.get(id);
+      if (existing) {
+        if (existing.tenant_id === tenant.tenantId) importedModels.add(id);
+        record('model', id, 'skipped', { reason: 'A model with this id already exists' });
+        continue;
+      }
+      await storeBlobs(blobs, documents);
+      const last = versions.at(-1);
+      await tx(db, async (t) => {
+        await t.modelInsert.run(id, tenant.tenantId, name, raw.category, String(raw.createdAt ?? versions[0].createdAt));
+        for (const v of versions) {
+          await t.modelVersionInsert.run(id, v.version, JSON.stringify(v.data), v.dataSha256, v.note, v.createdAt, `import:${actor}`);
+        }
+        if (last.version > 1) await t.modelBump.run(last.version, last.createdAt, id);
+        await insertDocs(t, documents, null, id);
+        await appendAudit(t, { actor, action: 'model.imported', target: id, details: { versions: versions.length, documents: documents.length } });
+      });
+      importedModels.add(id);
+      record('model', id, 'imported', { versions: versions.length, documents: documents.length });
+    } catch (err) {
+      fail('model', id, err);
+    }
+  }
+
   for (const raw of bundle.passports) {
     const id = isPlainObject(raw) ? raw.id : undefined;
     try {
-      const p = preparePassport(raw);
-      if (await st.passportById.get(p.id)) {
-        results.push({ id, status: 'skipped', reason: 'A passport with this id already exists' });
+      if (!isPlainObject(raw)) throw badRequest('passport entry must be an object');
+      validatePassportFields({ id: raw.id, productIdentifier: raw.productIdentifier, category: raw.category });
+      if (raw.id === undefined) throw badRequest('passport id is required for import');
+      const modelId = raw.modelId ?? null;
+      if (modelId && !importedModels.has(modelId)) throw badRequest(`model ${modelId} is not part of this import`);
+      const versions = prepareVersions(raw.versions);
+      const documents = prepareDocuments(raw.documents);
+      if (await st.passportById.get(raw.id)) {
+        record('passport', id, 'skipped', { reason: 'A passport with this id already exists' });
         continue;
       }
-      for (const d of p.documents) d.sha256 = await blobs.put(d.buf);
-      const last = p.versions.at(-1);
+      await storeBlobs(blobs, documents);
+      const last = versions.at(-1);
       await tx(db, async (t) => {
-        await t.passportInsert.run(p.id, tenant.tenantId, p.productIdentifier, p.category, last.version, p.createdAt, last.createdAt);
-        for (const v of p.versions) {
-          await t.versionInsert.run(p.id, v.version, JSON.stringify(v.data), v.dataSha256, v.note, v.createdAt, `import:${tenant.keyId}`);
+        await t.passportInsert.run(raw.id, tenant.tenantId, raw.productIdentifier, raw.category, last.version, String(raw.createdAt ?? versions[0].createdAt), last.createdAt, modelId);
+        for (const v of versions) {
+          await t.versionInsert.run(raw.id, v.version, JSON.stringify(v.data), v.dataSha256, v.note, v.createdAt, `import:${actor}`);
         }
-        for (const d of p.documents) {
-          await t.docInsert.run(d.id, p.id, d.name, d.contentType, d.buf.length, d.sha256, d.access, d.createdAt, d.removedAt);
-        }
+        await insertDocs(t, documents, raw.id, null);
         await appendAudit(t, {
           actor,
           action: 'passport.imported',
-          target: p.id,
-          details: { versions: p.versions.length, documents: p.documents.length, source: String(bundle.source ?? '') },
+          target: raw.id,
+          details: { versions: versions.length, documents: documents.length, source: String(bundle.source ?? '') },
         });
       });
-      results.push({ id, status: 'imported', versions: p.versions.length, documents: p.documents.length });
+      record('passport', id, 'imported', { versions: versions.length, documents: documents.length });
     } catch (err) {
-      if (err instanceof HttpError) results.push({ id, status: 'error', message: err.message });
-      else if (isUniqueViolation(err)) results.push({ id, status: 'error', message: 'Conflicting id or productIdentifier' });
-      else throw err;
+      fail('passport', id, err);
     }
   }
-  const count = (s) => results.filter((r) => r.status === s).length;
-  return { imported: count('imported'), skipped: count('skipped'), errors: count('error'), results };
+
+  const count = (kind, status) => results.filter((r) => r.kind === kind && r.status === status).length;
+  return {
+    imported: count('passport', 'imported'),
+    skipped: count('passport', 'skipped'),
+    errors: count('passport', 'error'),
+    models: { imported: count('model', 'imported'), skipped: count('model', 'skipped'), errors: count('model', 'error') },
+    results,
+  };
 }
