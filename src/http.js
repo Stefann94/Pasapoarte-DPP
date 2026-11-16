@@ -169,7 +169,8 @@ export function wantsJson(req, url) {
 
 export function applySecurityHeaders(res, config) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
+  // same-origin: nothing leaks to other sites, but same-site form posts keep a real Origin header.
+  res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader(
     'Content-Security-Policy',

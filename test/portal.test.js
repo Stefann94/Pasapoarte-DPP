@@ -171,6 +171,18 @@ describe('models, bulk passports and client portal', () => {
       form: new URLSearchParams({ name: 'X', category: 'ev' }),
     });
     assert.equal(csrf.status, 403);
+
+    // What real browsers send: same-origin form posts must work even with Origin: null.
+    const browserLike = await a.call('POST', '/portal/login', {
+      headers: { 'Sec-Fetch-Site': 'same-origin', Origin: 'null' },
+      form: new URLSearchParams({ email: 'ana@example.com', password: 'parola-lunga-1' }),
+    });
+    assert.equal(browserLike.status, 303);
+    const crossSite = await a.call('POST', '/portal/login', {
+      headers: { 'Sec-Fetch-Site': 'cross-site', Origin: 'https://evil.example' },
+      form: new URLSearchParams({ email: 'ana@example.com', password: 'parola-lunga-1' }),
+    });
+    assert.equal(crossSite.status, 403);
   });
 
   test('portal: create a model, add batteries from CSV, upload a document, get QR', async () => {

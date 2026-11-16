@@ -69,17 +69,23 @@ export async function portalUser(req, st) {
  * this also rejects any POST whose Origin is a different site.
  */
 export function checkOrigin(req, config) {
-  const origin = req.headers.origin;
-  if (!origin || origin === 'null') {
-    if (origin === 'null') throw new HttpError(403, 'bad_origin', 'Cross-site request blocked');
-    return;
+  const blocked = () => new HttpError(403, 'bad_origin', 'Cross-site request blocked');
+  // Modern browsers state the relationship directly; this is the most reliable signal.
+  const site = req.headers['sec-fetch-site'];
+  if (site) {
+    if (site === 'same-origin' || site === 'none') return;
+    throw blocked();
   }
+  // Older browsers: compare the Origin header. Non-browser clients send none.
+  const origin = req.headers.origin;
+  if (!origin) return;
+  if (origin === 'null') throw blocked();
   let host;
   try {
     host = new URL(origin).host;
   } catch {
-    throw new HttpError(403, 'bad_origin', 'Cross-site request blocked');
+    throw blocked();
   }
   const allowed = new Set([new URL(config.baseUrl).host, req.headers.host, req.headers['x-forwarded-host']].filter(Boolean));
-  if (!allowed.has(host)) throw new HttpError(403, 'bad_origin', 'Cross-site request blocked');
+  if (!allowed.has(host)) throw blocked();
 }
