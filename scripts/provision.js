@@ -86,8 +86,20 @@ if (project) {
   }
 } else {
   const orgs = await supa('GET', '/v1/organizations');
-  if (!orgs.length) throw new Error('No Supabase organization found on this account');
-  const org = orgs[0];
+  if (!orgs.length) throw new Error('No Supabase organization is visible to this token');
+  // Never pick an organization by accident: use SUPABASE_ORG (name or slug),
+  // or the only organization the token can see.
+  const wanted = env.SUPABASE_ORG?.toLowerCase();
+  const org = wanted
+    ? orgs.find((o) => o.name.toLowerCase() === wanted || (o.slug ?? o.id).toLowerCase() === wanted)
+    : orgs.length === 1
+      ? orgs[0]
+      : null;
+  if (!org) {
+    throw new Error(
+      `Cannot choose the organization automatically. Set SUPABASE_ORG in .env to one of: ${orgs.map((o) => `"${o.name}"`).join(', ')}`,
+    );
+  }
   dbPass = randomBytes(24).toString('base64url');
   saveEnv({ SUPABASE_DB_PASSWORD: dbPass }); // saved before creation so it is never lost
   const body = { name: PROJECT_NAME, db_pass: dbPass, region: REGION, organization_slug: org.slug ?? org.id };
