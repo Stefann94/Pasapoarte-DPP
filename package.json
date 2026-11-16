@@ -1,0 +1,15 @@
+{
+  "name": "dpp-hosting",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MVP: hosting service for EU Digital Product Passports (batteries, Regulation (EU) 2023/1542)",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/index.js",
+    "demo": "node --env-file-if-exists=.env scripts/seed-demo.js",
+    "test": "node --test test/"
+  }
+}
