@@ -3,6 +3,7 @@ import { appendAudit } from './audit.js';
 import { sha256 } from './crypto.js';
 import { isUniqueViolation, tx } from './db.js';
 import { badRequest, HttpError, isPlainObject } from './http.js';
+import { validateExternalUrl } from './mirror.js';
 import {
   CATEGORIES,
   DOCUMENT_TYPES,
@@ -71,6 +72,7 @@ export async function buildExport(st, blobs, config, tenant, { includeDocuments 
       productIdentifier: p.product_identifier,
       category: p.category,
       modelId: p.model_id ?? null,
+      externalUrl: p.external_url ?? null,
       createdAt: p.created_at,
       currentVersion: p.current_version,
       versions: versionsOf(await st.versionAll.all(p.id)),
@@ -194,6 +196,7 @@ export async function importBundle(db, st, blobs, tenant, bundle) {
       if (raw.id === undefined) throw badRequest('passport id is required for import');
       const modelId = raw.modelId ?? null;
       if (modelId && !importedModels.has(modelId)) throw badRequest(`model ${modelId} is not part of this import`);
+      const externalUrl = raw.externalUrl ? validateExternalUrl(raw.externalUrl, { allowInsecure: true }) : null;
       const versions = prepareVersions(raw.versions);
       const documents = prepareDocuments(raw.documents);
       if (await st.passportById.get(raw.id)) {
@@ -203,7 +206,7 @@ export async function importBundle(db, st, blobs, tenant, bundle) {
       await storeBlobs(blobs, documents);
       const last = versions.at(-1);
       await tx(db, async (t) => {
-        await t.passportInsert.run(raw.id, tenant.tenantId, raw.productIdentifier, raw.category, last.version, String(raw.createdAt ?? versions[0].createdAt), last.createdAt, modelId);
+        await t.passportInsert.run(raw.id, tenant.tenantId, raw.productIdentifier, raw.category, last.version, String(raw.createdAt ?? versions[0].createdAt), last.createdAt, modelId, externalUrl);
         for (const v of versions) {
           await t.versionInsert.run(raw.id, v.version, JSON.stringify(v.data), v.dataSha256, v.note, v.createdAt, `import:${actor}`);
         }

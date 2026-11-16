@@ -8,6 +8,10 @@ Platforma **nu generează** conținutul pașapoartelor. Îl primește de la oper
 
 **Pentru clienți există un portal** (`/portal`): se autentifică, creează modele de baterii, adaugă bateriile prin listă sau CSV, încarcă documente, descarcă codurile QR și lista de adrese pentru etichete și exportă tot. Nu e nevoie de programatori.
 
+**Găzduire externă cu copie de siguranță în UE.** Când producătorul (de exemplu, fabrica din China) găzduiește deja pașaportul, codul QR indică totuși domeniul acestei platforme, pe care îl controlează importatorul. Cât timp serverul producătorului funcționează, vizitatorii sunt redirecționați direct către el, printr-un singur salt https. Platforma copiază zilnic pașaportul extern în stocarea din UE. Dacă serverul extern cade, vizitatorii văd automat copia arhivată. Așa se acoperă art. 78(e) din Regulamentul (UE) 2023/1542: pașaportul trebuie să rămână disponibil, iar răspunderea este a importatorului, nu a gazdei.
+
+**Consolă de administrare** (`/console`, autentificare cu `ADMIN_TOKEN`): clienți, conturi de portal și linkuri de activare, chei API, suspendare, organizații cu acces restricționat și jurnalul de audit verificat. Secretele se afișează o singură dată.
+
 **Model + baterie.** Datele comune (producător, chimie, capacitate, documente) se completează o singură dată per **model**. Pentru fiecare baterie se stochează doar identificatorul și eventualele date proprii (data fabricației, starea). Pagina publică afișează combinația lor. Volumul stocat scade de sute până la mii de ori, iar o corecție la model apare imediat pe toate pașapoartele modelului.
 
 | Funcție | Detalii |
@@ -87,7 +91,10 @@ Autentificare: `Authorization: Bearer <token>`.
 | POST | `/api/models/:id/passports` | creare în masă: `{items: [{productIdentifier, data?}]}`, maximum 5.000 per cerere |
 | GET | `/api/models/:id/passports` | bateriile modelului |
 | POST | `/api/models/:id/documents?name&access` | document comun pentru toate bateriile modelului |
-| POST | `/api/passports` | creează (opțional `modelId`): `{id?, productIdentifier, category: ev\|lmt\|industrial, data: {public, legitimateInterest?, authorities?}, note?}` |
+| PUT | `/api/passports/:id/external` | `{externalUrl}` pentru găzduire externă cu copie UE, `null` pentru găzduire pe platformă |
+| POST | `/api/passports/:id/mirror/check` | verifică acum serverul extern și actualizează copia din UE |
+| GET | `/api/passports/:id/mirror` | starea copiei și istoricul (căderi, copii noi) |
+| POST | `/api/passports` | creează (opțional `modelId`, opțional `externalUrl`): `{id?, productIdentifier, category: ev\|lmt\|industrial, data: {public, legitimateInterest?, authorities?}, note?}` |
 | GET | `/api/passports?limit&offset` | listă |
 | GET | `/api/passports/:id` | date curente, istoricul versiunilor, documente |
 | PUT | `/api/passports/:id` | versiune nouă: `{data, note?, expectedVersion?}` |
@@ -104,6 +111,8 @@ Autentificare: `Authorization: Bearer <token>`.
 | GET | `/p/:id` | pagina pașaportului (HTML sau JSON); cu token `dpa_...` sau sesiune vede și nivelurile restricționate |
 | GET | `/p/:id/documents/:docId` | document, dacă nivelul de acces permite |
 | POST | `/p/:id/access`, `/p/:id/logout` | autentificare/ieșire din browser cu token |
+| GET | `/p/:id?mirror=1` | forțează afișarea copiei din UE (pentru audit) |
+| GET | `/api/cron/mirror` | verificarea zilnică a serverelor externe (Vercel Cron, 03:00 UTC) |
 | GET | `/healthz` | verificare stare |
 
 Exemplu PowerShell:
@@ -123,6 +132,12 @@ Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/passports -Headers
 
 Securitate: parole scrypt, sesiuni HttpOnly pe 12 ore, blocarea cererilor venite de pe alte site-uri, izolare completă între clienți. Un cont suspendat poate doar citi și exporta.
 
+## Verificarea zilnică (Vercel Cron)
+
+`vercel.json` programează `/api/cron/mirror` zilnic. Fiecare rulare verifică pașapoartele externe neverificate în ultimele 12 ore, cele mai vechi primele, cât încape în limita de timp a funcției. Dacă setați `CRON_SECRET` în Vercel, ruta cere acest secret, pe care Vercel îl trimite automat. Fără el, ruta rămâne inofensivă, pentru că nu verifică de mai multe ori decât e programat. Planul Hobby permite o rulare pe zi. La volume mari e nevoie de rulări mai dese (Vercel Pro sau un programator extern).
+
+Descărcarea paginilor externe este protejată: doar https, fără adrese private, interne sau de metadate cloud, maximum 3 redirecționări (verificate fiecare), 8 secunde și 10 MB. Copiile HTML sunt servite izolat, fără scripturi.
+
 ## Arhitectură
 
 ```
@@ -141,8 +156,10 @@ src/
   views.js        HTML public (RO/EN)
   fields.js       câmpurile uzuale (formulare + etichete RO/EN)
   documents.js    încărcare/ascundere documente (pașaport sau model)
+  mirror.js       găzduire externă: verificare, copie UE, protecție SSRF
+  admin-ops.js    operațiile de administrare (comune API și consolă)
   portal/         portal clienți: autentificare, formulare, pagini
-  routes/         admin, tenant (API client), public, portal
+  routes/         admin (API), console (web), tenant (API client), public, portal
 api/index.js      punctul de intrare pentru Vercel
 vercel.json       rutare, regiune fra1
 test/             teste cap-coadă (node:test, pe PGlite)

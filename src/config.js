@@ -46,5 +46,9 @@ export function loadConfig(env = process.env) {
     // How long a cached public passport is served without re-checking the
     // database. Writes on the same instance invalidate immediately.
     snapshotTtlMs: Number(env.SNAPSHOT_TTL_MS ?? 2000),
+    // Secret Vercel Cron sends as a bearer token (optional, see /api/cron/mirror).
+    cronSecret: env.CRON_SECRET || null,
+    // Tests only: lets the mirror fetch from localhost over http.
+    mirrorAllowPrivate: env.MIRROR_ALLOW_PRIVATE === '1',
   };
 }

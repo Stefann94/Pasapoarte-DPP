@@ -32,6 +32,12 @@ const STRINGS = {
     landing: 'Digital product passport hosting',
     landingText: 'Scan the QR code on a battery to view its passport.',
     portal: 'Client portal: sign in',
+    mirrorTitle: 'Battery passport (archived EU copy)',
+    mirrorNotice: 'The primary host of this passport is currently unavailable. You are viewing the copy archived in the EU.',
+    mirrorArchivedAt: 'Archived on',
+    mirrorSource: 'Original address',
+    mirrorOpen: 'Open the archived passport',
+    mirrorFingerprint: 'Archived copy fingerprint (SHA-256)',
     categories: {
       ev: 'Electric vehicle battery',
       lmt: 'Light means of transport battery',
@@ -66,6 +72,12 @@ const STRINGS = {
     landing: 'Găzduire pașapoarte digitale de produs',
     landingText: 'Scanați codul QR de pe baterie pentru a vedea pașaportul.',
     portal: 'Portal clienți: autentificare',
+    mirrorTitle: 'Pașaportul bateriei (copie arhivată în UE)',
+    mirrorNotice: 'Serverul principal al acestui pașaport nu este disponibil momentan. Vedeți copia arhivată în UE.',
+    mirrorArchivedAt: 'Arhivat la',
+    mirrorSource: 'Adresa originală',
+    mirrorOpen: 'Deschide pașaportul arhivat',
+    mirrorFingerprint: 'Amprenta copiei arhivate (SHA-256)',
     categories: {
       ev: 'Baterie pentru vehicul electric',
       lmt: 'Baterie pentru mijloace ușoare de transport',
@@ -208,4 +220,31 @@ export function renderErrorPage({ lang, status, message }) {
 export function renderLanding(lang) {
   const t = STRINGS[lang];
   return layout({ lang, title: t.landing, langLinkBase: '/', body: `<section><p>${esc(t.landingText)}</p></section><section><a href="/portal/login">${esc(t.portal)}</a></section>` });
+}
+
+/** Page shown when an external passport's host is down: the EU-archived copy. */
+export function renderMirrorPage({ lang, passport, mirror }) {
+  const t = STRINGS[lang];
+  const path = `/p/${encodeURIComponent(passport.id)}`;
+  const archived = mirror.fetchedAt ? new Date(mirror.fetchedAt).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : '';
+  const meta = `<section class="meta">
+    <div><span>${esc(t.productIdentifier)}</span><strong>${esc(passport.product_identifier)}</strong></div>
+    <div><span>${esc(t.mirrorArchivedAt)}</span><strong>${esc(archived)}</strong></div>
+    <div style="grid-column:1/-1"><span>${esc(t.mirrorSource)}</span><span class="mono">${esc(mirror.externalUrl)}</span></div>
+    <div style="grid-column:1/-1"><span>${esc(t.mirrorFingerprint)}</span><span class="mono">${esc(mirror.sha256)}</span></div>
+  </section>`;
+  let content;
+  if (mirror.data && typeof mirror.data === 'object') {
+    // Our own export format ({data: {public, ...}}) or any JSON document.
+    const pub = mirror.data?.data?.public ?? mirror.data?.public ?? mirror.data;
+    content = dataSection(t.public, pub, t, lang);
+  } else {
+    content = `<section><p><a href="${path}/mirror/content">${esc(t.mirrorOpen)}</a> <span class="muted">(${esc(mirror.contentType ?? '')})</span></p></section>`;
+  }
+  return layout({
+    lang,
+    title: t.mirrorTitle,
+    langLinkBase: path,
+    body: `<section style="border-color:var(--accent)"><p>${esc(t.mirrorNotice)}</p></section>${meta}${content}`,
+  });
 }

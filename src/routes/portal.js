@@ -16,6 +16,7 @@ import {
   passportUrl,
 } from '../passports.js';
 import { buildExport } from '../portability.js';
+import { checkMirror, validateExternalUrl } from '../mirror.js';
 import {
   checkOrigin,
   createPortalSession,
@@ -29,6 +30,7 @@ import {
 } from '../portal/auth.js';
 import { csvEscape, dataToForm, formToData, formValues, itemsFromCsv, readMultipart } from '../portal/forms.js';
 import {
+  accountPage,
   dashboardPage,
   loginPage,
   messagePage,
@@ -137,12 +139,13 @@ export function registerPortalRoutes(router) {
   // ------------------------------------------------------------ dashboard & models
 
   router.get('/portal', page(async ({ req, res, url, st, user }) => {
-    const [models, recent, count] = await Promise.all([
+    const [models, recent, count, mirror] = await Promise.all([
       st.modelList.all(user.tenantId),
       st.passportRecent.all(user.tenantId, 10),
       st.passportCount.get(user.tenantId),
+      st.mirrorCounts.get(user.tenantId),
     ]);
-    sendHtml(req, res, 200, dashboardPage({ user, models, recent, totalPassports: count.n, flash: flashOf(url) }), noStore);
+    sendHtml(req, res, 200, dashboardPage({ user, models, recent, totalPassports: count.n, mirror, flash: flashOf(url) }), noStore);
   }));
 
   router.get('/portal/models/new', page(async ({ req, res, user }) => {
@@ -230,7 +233,7 @@ export function registerPortalRoutes(router) {
     const text = file && typeof file !== 'string' && file.size ? await file.text() : pasted;
     try {
       const items = itemsFromCsv(text);
-      await createPassportsBulk(db, { tenant: user, model, items });
+      await createPassportsBulk(db, { tenant: user, model, items, urlOptions: { allowInsecure: config.mirrorAllowPrivate } });
       redirect(res, `/portal/models/${encodeURIComponent(model.id)}?msg=passports_created`);
     } catch (err) {
       if (err instanceof HttpError && err.status < 500) {
@@ -263,12 +266,13 @@ export function registerPortalRoutes(router) {
     const { req, res, url, st, params, user, config } = ctx;
     const passport = await ownPassport(st, user, params.id);
     const model = passport.model_id ? await st.modelById.get(passport.model_id) : null;
-    const [v, versions, docs, mv, modelDocs] = await Promise.all([
+    const [v, versions, docs, mv, modelDocs, mirrorEvents] = await Promise.all([
       st.versionGet.get(passport.id, passport.current_version),
       st.versionList.all(passport.id),
       st.docActive.all(passport.id),
       model ? st.modelVersionGet.get(model.id, model.current_version) : null,
       model ? st.modelDocActive.all(model.id) : [],
+      passport.external_url ? st.mirrorEvents.all(passport.id) : [],
     ]);
     const itemData = JSON.parse(v.data);
     const publicUrl = passportUrl(config, passport.id);
@@ -282,12 +286,68 @@ export function registerPortalRoutes(router) {
       versions,
       qrSvg: await QRCode.toString(publicUrl, { type: 'svg', errorCorrectionLevel: 'M', margin: 1 }),
       publicUrl,
+      mirrorEvents,
       flash: flashOf(url),
       errors,
     }), noStore);
   }
 
   router.get('/portal/passports/:id', page((ctx) => renderPassport(ctx)));
+
+  router.post('/portal/passports/:id/external', page(async (ctx) => {
+    const { req, res, db, st, blobs, params, user, config, snapshots } = ctx;
+    const passport = await ownPassport(st, user, params.id);
+    const form = await readForm(req, 8192);
+    const raw = String(form.get('externalUrl') ?? '').trim();
+    let ext = null;
+    if (raw) {
+      try {
+        ext = validateExternalUrl(raw, { allowInsecure: config.mirrorAllowPrivate });
+      } catch (err) {
+        return renderPassport(ctx, { status: 400, errors: [`Adresa externă nu este validă: ${err.message}`] });
+      }
+    }
+    await tx(db, async (t) => {
+      await t.passportSetExternal.run(ext, new Date().toISOString(), passport.id);
+      await appendAudit(t, { actor: user.actor, action: 'passport.external_set', target: passport.id, details: { externalUrl: ext } });
+    });
+    if (ext) await checkMirror(st, blobs, config, await st.passportById.get(passport.id));
+    snapshots.invalidate(passport.id);
+    redirect(res, `/portal/passports/${encodeURIComponent(passport.id)}?msg=${ext ? 'external_set' : 'external_removed'}`);
+  }, { write: true }));
+
+  router.post('/portal/passports/:id/mirror/check', page(async ({ res, st, blobs, params, user, config, snapshots }) => {
+    const passport = await ownPassport(st, user, params.id);
+    if (passport.external_url) await checkMirror(st, blobs, config, passport);
+    snapshots.invalidate(passport.id);
+    redirect(res, `/portal/passports/${encodeURIComponent(passport.id)}?msg=mirror_checked`);
+  }));
+
+  // ------------------------------------------------------------ account
+
+  router.get('/portal/account', page(async ({ req, res, url, user }) => {
+    sendHtml(req, res, 200, accountPage({ user, flash: flashOf(url) }), noStore);
+  }));
+
+  router.post('/portal/account', page(async ({ req, res, db, st, user, config }) => {
+    const form = await readForm(req, 8192);
+    const row = await st.userById.get(user.userId);
+    const password = String(form.get('password') ?? '');
+    let error = null;
+    if (!(await verifyPassword(String(form.get('current') ?? ''), row?.password_hash ?? null))) error = 'Parola actuală nu este corectă.';
+    else if (password.length < MIN_PASSWORD) error = `Parola nouă trebuie să aibă cel puțin ${MIN_PASSWORD} caractere.`;
+    else if (password !== form.get('password2')) error = 'Parolele noi nu coincid.';
+    if (error) return sendHtml(req, res, 400, accountPage({ user, error }), noStore);
+    const hash = await hashPassword(password);
+    await tx(db, async (t) => {
+      await t.userSetPassword.run(hash, user.userId);
+      await t.portalSessionDeleteForUser.run(user.userId);
+      await appendAudit(t, { actor: user.actor, action: 'user.password_changed', target: user.userId });
+    });
+    // Keep this browser signed in with a fresh session; others were closed.
+    const sid = await createPortalSession(st, user.userId);
+    redirect(res, '/portal/account?msg=password_changed', { 'Set-Cookie': portalCookie(config, sid, PORTAL_SESSION_TTL_MS / 1000) });
+  }));
 
   router.post('/portal/passports/:id', page(async (ctx) => {
     const { req, res, db, st, params, user, snapshots } = ctx;

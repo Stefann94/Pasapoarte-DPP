@@ -5,6 +5,7 @@ import { canSee, LEVELS } from './auth.js';
 import { isUniqueViolation, statements, tx } from './db.js';
 import { appendAudit } from './audit.js';
 import { createLru } from './lru.js';
+import { validateExternalUrl } from './mirror.js';
 
 export const CATEGORIES = ['ev', 'lmt', 'industrial'];
 export const PASSPORT_ID_RE = /^[A-Za-z0-9._~-]{8,128}$/;
@@ -112,7 +113,7 @@ const conflict = (message) => new HttpError(409, 'conflict', message);
 const EMPTY_DATA = { public: {} };
 export const MAX_BULK = 5000;
 
-export async function createPassport(db, { tenant, id, productIdentifier, category, modelId, data, note }) {
+export async function createPassport(db, { tenant, id, productIdentifier, category, modelId, data, note, externalUrl, urlOptions }) {
   let model = null;
   if (modelId !== undefined && modelId !== null) {
     model = await ownModel(statements(db), tenant, modelId);
@@ -121,13 +122,14 @@ export async function createPassport(db, { tenant, id, productIdentifier, catego
   validatePassportFields({ id, productIdentifier, category });
   const normalized = normalizeData(data ?? EMPTY_DATA);
   const cleanNote = validateNote(note);
+  const external = externalUrl ? validateExternalUrl(externalUrl, urlOptions) : null;
   const passportId = id ?? randomUUID();
   const now = new Date().toISOString();
   const dataHash = hashData(normalized);
   const { actor } = tenant;
   try {
     await tx(db, async (st) => {
-      await st.passportInsert.run(passportId, tenant.tenantId, productIdentifier, category, 1, now, now, model?.id ?? null);
+      await st.passportInsert.run(passportId, tenant.tenantId, productIdentifier, category, 1, now, now, model?.id ?? null, external);
       await st.versionInsert.run(passportId, 1, JSON.stringify(normalized), dataHash, cleanNote, now, actor);
       await appendAudit(st, { actor, action: 'passport.created', target: passportId, details: { version: 1, dataHash, modelId: model?.id ?? null } });
     });
@@ -135,14 +137,14 @@ export async function createPassport(db, { tenant, id, productIdentifier, catego
     if (isUniqueViolation(err)) throw conflict('A passport with this id or productIdentifier already exists');
     throw err;
   }
-  return { id: passportId, version: 1, dataHash, modelId: model?.id ?? null };
+  return { id: passportId, version: 1, dataHash, modelId: model?.id ?? null, externalUrl: external };
 }
 
 /**
  * Creates passports for many batteries of one model in a single transaction
  * (two INSERT statements in total). items: [{productIdentifier, id?, data?}]
  */
-export async function createPassportsBulk(db, { tenant, model, items, note }) {
+export async function createPassportsBulk(db, { tenant, model, items, note, urlOptions }) {
   if (!Array.isArray(items) || !items.length) throw badRequest('items must be a non-empty array');
   if (items.length > MAX_BULK) throw badRequest(`At most ${MAX_BULK} batteries per request`);
   const cleanNote = validateNote(note);
@@ -162,7 +164,15 @@ export async function createPassportsBulk(db, { tenant, model, items, note }) {
     if (seenId.has(id)) throw badRequest(`Duplicate id in request: ${id}`);
     seenId.add(id);
     const data = normalizeData(item.data ?? EMPTY_DATA);
-    return { id, pid, data: JSON.stringify(data), hash: hashData(data) };
+    let ext = '';
+    if (item.externalUrl) {
+      try {
+        ext = validateExternalUrl(item.externalUrl, urlOptions);
+      } catch (err) {
+        throw badRequest(`items[${i}]: ${err.message}`);
+      }
+    }
+    return { id, pid, ext, data: JSON.stringify(data), hash: hashData(data) };
   });
 
   const st = statements(db);
@@ -179,7 +189,7 @@ export async function createPassportsBulk(db, { tenant, model, items, note }) {
   const { actor } = tenant;
   try {
     await tx(db, async (t) => {
-      await t.passportBulkInsert.run(rows.map((r) => r.id), rows.map((r) => r.pid), tenant.tenantId, model.category, now, model.id);
+      await t.passportBulkInsert.run(rows.map((r) => r.id), rows.map((r) => r.pid), tenant.tenantId, model.category, now, model.id, rows.map((r) => r.ext));
       await t.versionBulkInsert.run(rows.map((r) => r.id), rows.map((r) => r.data), rows.map((r) => r.hash), cleanNote, now, actor);
       await appendAudit(t, {
         actor,

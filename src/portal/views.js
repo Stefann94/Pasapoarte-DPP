@@ -22,6 +22,10 @@ export const FLASH = {
   document_added: 'Documentul a fost încărcat.',
   document_removed: 'Documentul a fost ascuns.',
   password_set: 'Parola a fost setată. Vă puteți autentifica.',
+  password_changed: 'Parola a fost schimbată.',
+  external_set: 'Adresa externă a fost salvată și verificată.',
+  external_removed: 'Pașaportul este din nou găzduit pe platformă.',
+  mirror_checked: 'Verificarea a fost făcută.',
 };
 
 const CSS = `${PUBLIC_CSS}
@@ -55,10 +59,12 @@ textarea{min-height:80px;resize:vertical}
 .pager{display:flex;gap:12px;margin-top:12px}
 `;
 
+export { CSS as PORTAL_CSS };
+
 function layout({ title, user, body, flash, errors }) {
   const nav = user
     ? `<nav class="top"><a class="brand" href="/portal">Pașapoarte DPP · ${esc(user.tenantName)}</a>
-        <a href="/portal">Modele</a><a href="/portal/export">Export</a>
+        <a href="/portal">Modele</a><a href="/portal/export">Export</a><a href="/portal/account">Cont</a>
         <form method="post" action="/portal/logout"><button class="link" type="submit">Ieșire</button></form></nav>`
     : `<nav class="top"><span class="brand">Pașapoarte DPP · Portal clienți</span></nav>`;
   const flashHtml = flash && FLASH[flash] ? `<div class="flash">${esc(FLASH[flash])}</div>` : '';
@@ -108,7 +114,7 @@ export function messagePage({ title, message, user }) {
 
 // ------------------------------------------------------------------ dashboard
 
-export function dashboardPage({ user, models, recent, totalPassports, flash }) {
+export function dashboardPage({ user, models, recent, totalPassports, mirror, flash }) {
   const rows = models.length
     ? models
         .map(
@@ -128,7 +134,9 @@ export function dashboardPage({ user, models, recent, totalPassports, flash }) {
     user,
     flash,
     body: `<div class="stats"><div><span class="muted">Modele</span><strong>${models.length}</strong></div>
-      <div><span class="muted">Pașapoarte</span><strong>${totalPassports}</strong></div></div>
+      <div><span class="muted">Pașapoarte</span><strong>${totalPassports}</strong></div>
+      ${mirror?.total ? `<div><span class="muted">Găzduite extern, cu copie UE</span><strong>${mirror.total}</strong>
+        <span class="${mirror.down ? '' : 'muted'}" style="${mirror.down ? 'color:var(--danger)' : ''}">${mirror.down ? `${mirror.down} cu serverul extern căzut` : 'toate funcționale'}</span></div>` : ''}</div>
       <section style="margin-top:16px"><div class="row" style="justify-content:space-between"><h2>Modele</h2>
       <a class="btn" href="/portal/models/new">+ Model nou</a></div>
       <p class="hint">Datele comune (producător, chimie, capacitate, documente) se completează o singură dată per model.
@@ -253,7 +261,8 @@ export function modelPage({ user, model, data, docs, passports, total, page, pag
         <div class="field"><label for="items">Câte un număr de serie (identificator) pe rând</label>
         <textarea id="items" name="items" placeholder="BAT-000001&#10;BAT-000002&#10;BAT-000003">${esc(bulkText ?? '')}</textarea></div>
         <div class="field"><label for="csv">sau un fișier CSV / Excel salvat ca CSV</label><input id="csv" type="file" name="csv" accept=".csv,.txt"></div>
-        <p class="hint">CSV: prima coloană este identificatorul. Coloanele următoare, cu antet (de ex. <code>manufacturingDate</code>), devin date proprii fiecărei baterii. Maximum 5.000 de rânduri odată.</p>
+        <p class="hint">CSV: prima coloană este identificatorul. Coloanele următoare, cu antet (de ex. <code>manufacturingDate</code>), devin date proprii fiecărei baterii.
+        O coloană <code>externalUrl</code> cu adresa pașaportului găzduit de producător face ca bateria să fie găzduită extern, cu copie de siguranță în UE. Maximum 5.000 de rânduri odată.</p>
         <button type="submit">Creează pașapoartele</button></form></section>
 
       <section><div class="row" style="justify-content:space-between"><h2>Baterii (${total})</h2>
@@ -270,7 +279,56 @@ export function modelPage({ user, model, data, docs, passports, total, page, pag
 
 // ------------------------------------------------------------------ passport page
 
-export function passportPage({ user, passport, model, values, effective, docs, versions, qrSvg, publicUrl, flash, errors }) {
+const MIRROR_STATUS = { ok: 'Funcțional', down: 'Căzut — vizitatorii văd copia din UE', unchecked: 'Neverificat încă' };
+
+function externalSection(passport, events) {
+  const base = `/portal/passports/${esc(passport.id)}`;
+  if (!passport.external_url) {
+    return `<section><h2>Găzduire externă (opțional)</h2>
+      <p class="hint">Dacă producătorul (de exemplu, fabrica din China) găzduiește deja pașaportul, introduceți adresa lui.
+      Codul QR rămâne pe domeniul acestei platforme: vizitatorii sunt trimiși la producător cât timp serverul lui funcționează,
+      iar dacă acesta cade, văd automat copia arhivată în UE. Răspunderea pentru disponibilitate rămâne a importatorului.</p>
+      <form method="post" action="${base}/external"><input name="externalUrl" type="url" placeholder="https://passport.producator.cn/..." required>
+      <button type="submit">Salvează și verifică</button></form></section>`;
+  }
+  const status = passport.mirror_status ?? 'unchecked';
+  const rows = events.map((e) => `<tr><td>${esc(fmtDate(e.at))}</td><td>${esc(e.status === 'ok' ? 'funcțional' : 'căzut')}</td>
+    <td>${e.sha256 ? 'copie nouă' : esc(e.error ?? '')}</td></tr>`).join('');
+  return `<section><h2>Găzduire externă și copia din UE</h2>
+    <section class="meta" style="border:0;padding:0">
+      <div><span>Server extern</span><strong style="color:${status === 'down' ? 'var(--danger)' : 'inherit'}">${esc(MIRROR_STATUS[status])}</strong></div>
+      <div><span>Ultima verificare</span><strong>${esc(fmtDate(passport.mirror_checked_at)) || '—'}</strong></div>
+      <div><span>Ultima copie arhivată</span><strong>${esc(fmtDate(passport.mirror_fetched_at)) || '—'}</strong></div>
+      <div style="grid-column:1/-1"><span>Adresa externă</span><a class="mono" href="${esc(passport.external_url)}" target="_blank" rel="noopener noreferrer">${esc(passport.external_url)}</a></div>
+    </section>
+    ${passport.mirror_error ? `<p class="hint" style="color:var(--danger)">Ultima eroare: ${esc(passport.mirror_error)}</p>` : ''}
+    <div class="row">
+      <form method="post" action="${base}/mirror/check"><button type="submit">Verifică acum</button></form>
+      ${passport.mirror_sha256 ? `<a class="btn secondary" href="/p/${esc(passport.id)}?mirror=1&lang=ro" target="_blank" rel="noopener">Vezi copia din UE</a>` : ''}
+      <form method="post" action="${base}/external"><input type="hidden" name="externalUrl" value=""><button class="secondary" type="submit">Găzduiește pe platformă</button></form>
+    </div>
+    <p class="hint">Verificarea automată rulează zilnic. Se păstrează un istoric al schimbărilor de stare și al copiilor noi.</p>
+    ${rows ? `<div class="table-wrap"><table><thead><tr><th>Data</th><th>Stare</th><th>Detalii</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}
+  </section>`;
+}
+
+export function accountPage({ user, error, flash }) {
+  return layout({
+    title: 'Contul meu',
+    user,
+    flash,
+    errors: error ? [error] : [],
+    body: `<section><p>Cont: <strong>${esc(user.email)}</strong> · ${esc(user.tenantName)}</p>
+      <form class="stack" method="post" action="/portal/account">
+      <div class="field"><label for="current">Parola actuală</label><input id="current" name="current" type="password" autocomplete="current-password" required></div>
+      <div class="field"><label for="p1">Parola nouă (minimum 10 caractere)</label><input id="p1" name="password" type="password" autocomplete="new-password" minlength="10" required></div>
+      <div class="field"><label for="p2">Repetați parola nouă</label><input id="p2" name="password2" type="password" autocomplete="new-password" minlength="10" required></div>
+      <button type="submit">Schimbă parola</button></form>
+      <p class="hint">După schimbare, celelalte sesiuni deschise ale contului sunt închise.</p></section>`,
+  });
+}
+
+export function passportPage({ user, passport, model, values, effective, docs, versions, qrSvg, publicUrl, mirrorEvents = [], flash, errors }) {
   const versionRows = versions
     .slice()
     .reverse()
@@ -287,6 +345,8 @@ export function passportPage({ user, passport, model, values, effective, docs, v
         <p><span class="muted">Model:</span> ${model ? `<a href="/portal/models/${esc(model.id)}">${esc(model.name)}</a>` : '—'}</p>
         <div class="row"><a class="btn secondary" href="/portal/passports/${esc(passport.id)}/qr.svg">Descarcă QR (SVG)</a>
         <a class="btn secondary" href="${esc(publicUrl)}?lang=ro" target="_blank" rel="noopener">Vezi pagina publică</a></div></div></section>
+
+      ${externalSection(passport, mirrorEvents)}
 
       <form class="stack" method="post" action="/portal/passports/${esc(passport.id)}">
         <input type="hidden" name="expectedVersion" value="${passport.current_version}">

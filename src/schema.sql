@@ -152,6 +152,33 @@ CREATE TABLE IF NOT EXISTS dpp.portal_sessions (
   expires_at BIGINT NOT NULL
 );
 
+-- Externally hosted passports (e.g. by a non-EU manufacturer). The QR code
+-- points to this platform (a domain the importer controls); visitors are
+-- redirected to the external host while it works, and served the archived EU
+-- mirror copy when it does not.
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS external_url TEXT;
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS mirror_status TEXT;         -- NULL (never checked) | 'ok' | 'down'
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS mirror_checked_at TEXT;
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS mirror_sha256 TEXT;         -- last good copy (blob)
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS mirror_content_type TEXT;
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS mirror_fetched_at TEXT;     -- when the last good copy was taken
+ALTER TABLE dpp.passports ADD COLUMN IF NOT EXISTS mirror_error TEXT;
+CREATE INDEX IF NOT EXISTS passports_mirror_due ON dpp.passports (mirror_checked_at) WHERE external_url IS NOT NULL;
+
+-- Log of mirror events: only status changes and content changes are recorded.
+CREATE TABLE IF NOT EXISTS dpp.mirror_events (
+  id           TEXT PRIMARY KEY,
+  passport_id  TEXT NOT NULL REFERENCES dpp.passports(id),
+  at           TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  http_status  INTEGER,
+  sha256       TEXT,
+  content_type TEXT,
+  size         INTEGER,
+  error        TEXT
+);
+CREATE INDEX IF NOT EXISTS mirror_events_passport ON dpp.mirror_events (passport_id, at DESC);
+
 CREATE OR REPLACE FUNCTION dpp.reject_change() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION '%', TG_ARGV[0];
@@ -176,6 +203,7 @@ DROP TRIGGER IF EXISTS model_versions_immutable ON dpp.model_versions;
 CREATE TRIGGER model_versions_immutable BEFORE UPDATE OR DELETE ON dpp.model_versions
   FOR EACH ROW EXECUTE FUNCTION dpp.reject_change('model versions are immutable');
 
+ALTER TABLE dpp.mirror_events     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dpp.models            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dpp.model_versions    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dpp.users             ENABLE ROW LEVEL SECURITY;

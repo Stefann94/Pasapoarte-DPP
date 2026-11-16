@@ -16,6 +16,9 @@ import {
   passportUrl,
 } from '../passports.js';
 import { buildExport, importBundle } from '../portability.js';
+import { checkMirror, mirrorEventJson, mirrorJson, runDueChecks, validateExternalUrl } from '../mirror.js';
+import { safeEqual } from '../crypto.js';
+import { bearer } from '../auth.js';
 
 const summary = (config, p) => ({
   id: p.id,
@@ -23,6 +26,8 @@ const summary = (config, p) => ({
   productIdentifier: p.product_identifier,
   category: p.category,
   modelId: p.model_id ?? null,
+  externalUrl: p.external_url ?? null,
+  mirrorStatus: p.external_url ? (p.mirror_status ?? 'unchecked') : null,
   currentVersion: p.current_version,
   createdAt: p.created_at,
   updatedAt: p.updated_at,
@@ -92,7 +97,13 @@ export function registerTenantRoutes(router) {
     const tenant = await requireTenant(req, st, { write: true });
     const model = await ownModel(st, tenant, params.id);
     const body = await readJson(req, config.maxImportBytes);
-    const created = await createPassportsBulk(db, { tenant, model, items: body.items, note: body.note });
+    const created = await createPassportsBulk(db, {
+      tenant,
+      model,
+      items: body.items,
+      note: body.note,
+      urlOptions: { allowInsecure: config.mirrorAllowPrivate },
+    });
     sendJson(req, res, 201, { created: created.length, items: created.map((c) => ({ ...c, url: passportUrl(config, c.id) })) });
   });
 
@@ -131,7 +142,7 @@ export function registerTenantRoutes(router) {
 
   // ------------------------------------------------------------ passports
 
-  router.post('/api/passports', async ({ req, res, db, st, config }) => {
+  router.post('/api/passports', async ({ req, res, db, st, blobs, config }) => {
     const tenant = await requireTenant(req, st, { write: true });
     const body = await readJson(req, config.maxJsonBytes);
     const created = await createPassport(db, {
@@ -142,8 +153,61 @@ export function registerTenantRoutes(router) {
       modelId: body.modelId,
       data: body.data,
       note: body.note,
+      externalUrl: body.externalUrl,
+      urlOptions: { allowInsecure: config.mirrorAllowPrivate },
     });
-    sendJson(req, res, 201, { ...created, url: passportUrl(config, created.id) });
+    let mirror = null;
+    if (created.externalUrl) {
+      // First EU copy right away, so continuity starts on day one.
+      mirror = await checkMirror(st, blobs, config, await st.passportById.get(created.id));
+    }
+    sendJson(req, res, 201, { ...created, url: passportUrl(config, created.id), mirror });
+  });
+
+  // Set, change or remove (null) the external host of a passport.
+  router.put('/api/passports/:id/external', async ({ req, res, params, db, st, blobs, config, snapshots }) => {
+    const tenant = await requireTenant(req, st, { write: true });
+    const passport = await ownPassport(st, tenant, params.id);
+    const body = await readJson(req, config.maxJsonBytes);
+    const ext = body.externalUrl ? validateExternalUrl(body.externalUrl, { allowInsecure: config.mirrorAllowPrivate }) : null;
+    await tx(db, async (t) => {
+      await t.passportSetExternal.run(ext, new Date().toISOString(), passport.id);
+      await appendAudit(t, { actor: tenant.actor, action: 'passport.external_set', target: passport.id, details: { externalUrl: ext } });
+    });
+    const mirror = ext ? await checkMirror(st, blobs, config, await st.passportById.get(passport.id)) : null;
+    snapshots.invalidate(passport.id);
+    sendJson(req, res, 200, { id: passport.id, externalUrl: ext, mirror });
+  });
+
+  router.post('/api/passports/:id/mirror/check', async ({ req, res, params, st, blobs, config, snapshots }) => {
+    const tenant = await requireTenant(req, st);
+    const passport = await ownPassport(st, tenant, params.id);
+    if (!passport.external_url) throw badRequest('This passport is hosted here, not externally');
+    const result = await checkMirror(st, blobs, config, passport);
+    snapshots.invalidate(passport.id);
+    sendJson(req, res, 200, { ...result, mirror: mirrorJson(await st.passportById.get(passport.id)) });
+  });
+
+  router.get('/api/passports/:id/mirror', async ({ req, res, params, st }) => {
+    const tenant = await requireTenant(req, st);
+    const passport = await ownPassport(st, tenant, params.id);
+    if (!passport.external_url) throw badRequest('This passport is hosted here, not externally');
+    sendJson(req, res, 200, { ...mirrorJson(passport), events: (await st.mirrorEvents.all(passport.id)).map(mirrorEventJson) });
+  });
+
+  // Daily job (Vercel Cron). With CRON_SECRET set, Vercel sends it as a bearer
+  // token. Without it the endpoint still only checks passports not checked for
+  // 12 hours, so calling it repeatedly cannot cause extra outbound traffic.
+  router.get('/api/cron/mirror', async ({ req, res, st, blobs, config, snapshots }) => {
+    if (config.cronSecret) {
+      const token = bearer(req);
+      if (!token || !(safeEqual(token, config.cronSecret) || safeEqual(token, config.adminToken))) {
+        throw new HttpError(401, 'unauthorized', 'Missing or invalid credentials');
+      }
+    }
+    const summary = await runDueChecks(st, blobs, config, { limit: 300 });
+    if (summary.checked) snapshots.invalidateAll();
+    sendJson(req, res, 200, summary);
   });
 
   router.get('/api/passports', async ({ req, res, url, st, config }) => {
@@ -183,6 +247,7 @@ export function registerTenantRoutes(router) {
         createdBy: x.created_by,
       })),
       documents: [...modelDocs, ...docs].map((d) => documentJson(config, p.id, d)),
+      mirror: p.external_url ? mirrorJson(p) : null,
     });
   });
 

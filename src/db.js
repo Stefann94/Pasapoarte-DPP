@@ -98,12 +98,13 @@ export function statements(conn) {
 
     passportById: q('SELECT * FROM dpp.passports WHERE id = $1'),
     passportInsert: q(`INSERT INTO dpp.passports
-      (id, tenant_id, product_identifier, category, current_version, created_at, updated_at, model_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`),
+      (id, tenant_id, product_identifier, category, current_version, created_at, updated_at, model_id, external_url)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`),
     // Bulk creation (one round trip per table for thousands of batteries).
     passportBulkInsert: q(`INSERT INTO dpp.passports
-      (id, tenant_id, product_identifier, category, current_version, created_at, updated_at, model_id)
-      SELECT u.id, $3, u.pid, $4, 1, $5, $5, $6 FROM unnest($1::text[], $2::text[]) AS u(id, pid)`),
+      (id, tenant_id, product_identifier, category, current_version, created_at, updated_at, model_id, external_url)
+      SELECT u.id, $3, u.pid, $4, 1, $5, $5, $6, NULLIF(u.ext, '')
+      FROM unnest($1::text[], $2::text[], $7::text[]) AS u(id, pid, ext)`),
     versionBulkInsert: q(`INSERT INTO dpp.passport_versions
       (passport_id, version, data, data_hash, note, created_at, created_by)
       SELECT u.id, 1, u.data, u.hash, $4, $5, $6 FROM unnest($1::text[], $2::text[], $3::text[]) AS u(id, data, hash)`),
@@ -215,6 +216,32 @@ export function statements(conn) {
     portalSessionDelete: q('DELETE FROM dpp.portal_sessions WHERE id_hash = $1'),
     portalSessionDeleteForUser: q('DELETE FROM dpp.portal_sessions WHERE user_id = $1'),
     portalSessionSweep: q('DELETE FROM dpp.portal_sessions WHERE expires_at <= $1'),
+
+    // ---- external hosting + EU mirror
+    passportSetExternal: q(`UPDATE dpp.passports SET external_url = $1, mirror_status = NULL, mirror_checked_at = NULL,
+                            mirror_error = NULL, rev = rev + 1, updated_at = $2 WHERE id = $3`),
+    mirrorUpdate: q(`UPDATE dpp.passports SET mirror_status = $1, mirror_checked_at = $2, mirror_error = $3,
+                       mirror_sha256 = COALESCE($4, mirror_sha256), mirror_content_type = COALESCE($5, mirror_content_type),
+                       mirror_fetched_at = COALESCE($6, mirror_fetched_at),
+                       rev = rev + CASE WHEN $7::boolean THEN 1 ELSE 0 END
+                     WHERE id = $8`),
+    mirrorEventInsert: q(`INSERT INTO dpp.mirror_events (id, passport_id, at, status, http_status, sha256, content_type, size, error)
+                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`),
+    mirrorEvents: q('SELECT * FROM dpp.mirror_events WHERE passport_id = $1 ORDER BY at DESC LIMIT 20'),
+    mirrorDue: q(`SELECT * FROM dpp.passports WHERE external_url IS NOT NULL
+                  AND (mirror_checked_at IS NULL OR mirror_checked_at < $1)
+                  ORDER BY mirror_checked_at NULLS FIRST LIMIT $2`),
+    mirrorCounts: q(`SELECT COUNT(*)::int AS total,
+                       COUNT(*) FILTER (WHERE mirror_status = 'ok')::int AS ok,
+                       COUNT(*) FILTER (WHERE mirror_status = 'down')::int AS down
+                     FROM dpp.passports WHERE tenant_id = $1 AND external_url IS NOT NULL`),
+
+    // ---- admin console
+    tenantListWithStats: q(`SELECT t.*,
+        (SELECT COUNT(*)::int FROM dpp.passports p WHERE p.tenant_id = t.id) AS passport_count,
+        (SELECT COUNT(*)::int FROM dpp.users u WHERE u.tenant_id = t.id) AS user_count
+      FROM dpp.tenants t ORDER BY t.created_at DESC`),
+    apiKeyList: q('SELECT id, created_at, revoked_at FROM dpp.api_keys WHERE tenant_id = $1 ORDER BY created_at'),
 
     ping: q('SELECT 1 AS ok'),
   };

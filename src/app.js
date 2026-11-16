@@ -8,6 +8,7 @@ import { registerAdminRoutes } from './routes/admin.js';
 import { registerTenantRoutes } from './routes/tenant.js';
 import { registerPublicRoutes } from './routes/public.js';
 import { registerPortalRoutes } from './routes/portal.js';
+import { registerConsoleRoutes } from './routes/console.js';
 
 /**
  * Builds the application. Returns `handler` (a Node request listener, used
@@ -25,6 +26,7 @@ export async function createApp(config) {
   registerTenantRoutes(router);
   registerPublicRoutes(router);
   registerPortalRoutes(router);
+  registerConsoleRoutes(router);
 
   const sweep = setInterval(() => {
     const now = Date.now();
@@ -52,7 +54,7 @@ export async function createApp(config) {
       const code = err instanceof HttpError ? err.code : 'internal_error';
       const message = err instanceof HttpError ? err.message : 'Internal server error';
       if (status === 413) res.setHeader('Connection', 'close');
-      const isPage = (url.pathname === '/' || url.pathname.startsWith('/p/') || url.pathname.startsWith('/portal')) && !wantsJson(req, url);
+      const isPage = (url.pathname === '/' || url.pathname.startsWith('/p/') || url.pathname.startsWith('/portal') || url.pathname.startsWith('/console')) && !wantsJson(req, url);
       if (isPage) sendHtml(req, res, status, renderErrorPage({ lang: pickLang(req, url), status, message }));
       else sendJson(req, res, status, { error: code, message });
     }

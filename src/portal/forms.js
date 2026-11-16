@@ -122,6 +122,7 @@ export function parseCsv(text) {
   return rows.map((r) => r.map((x) => x.trim())).filter((r) => r.some((x) => x !== ''));
 }
 
+const EXTERNAL_RE = /^(externalurl|external|urlextern|adresaexterna|adresăexternă|hosturl)$/i;
 const HEADER_RE = /^(productidentifier|identificator|serial|serie|număr|numar|nr\.?|id|serialnumber|sn)$/i;
 
 /**
@@ -143,7 +144,10 @@ export function itemsFromCsv(text) {
       const pub = {};
       header.slice(1).forEach((h, i) => {
         const v = r[i + 1];
-        if (h && v) pub[h] = v;
+        if (!h || !v) return;
+        // A column with the external host's address makes it an externally hosted passport.
+        if (EXTERNAL_RE.test(h.replace(/\s+/g, ''))) item.externalUrl = v;
+        else pub[h] = v;
       });
       if (Object.keys(pub).length) item.data = { public: pub };
     }
