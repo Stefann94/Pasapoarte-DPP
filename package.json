@@ -12,7 +12,8 @@
     "migrate": "node --env-file-if-exists=.env scripts/migrate.js",
     "demo": "node --env-file-if-exists=.env scripts/seed-demo.js",
     "bench": "node scripts/bench.js",
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "provision": "node scripts/provision.js"
   },
   "dependencies": {
     "pg": "^8.23.1"

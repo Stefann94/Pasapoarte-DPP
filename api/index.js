@@ -7,7 +7,9 @@ import { createApp } from '../src/app.js';
 let appPromise;
 
 export default async function handler(req, res) {
-  appPromise ??= createApp(loadConfig()).catch((err) => {
+  // loadConfig runs inside the async function so a config error becomes a
+  // rejected promise (handled below) instead of crashing the function.
+  appPromise ??= (async () => createApp(loadConfig()))().catch((err) => {
     appPromise = undefined; // retry initialisation on the next request
     throw err;
   });
